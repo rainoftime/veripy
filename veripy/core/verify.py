@@ -5,9 +5,9 @@ from typing import List, Tuple, TypeVar
 from veripy.parser.syntax import *
 from veripy.parser.parser import parse_assertion, parse_expr
 from functools import wraps
-from veripy.transformer import *
+from veripy.core.transformer import *
 from functools import reduce
-from veripy.prettyprint import pretty_print
+from veripy.core.prettyprint import pretty_print
 from veripy import typecheck as tc
 from veripy.typecheck.types import TARR, TINT, TBOOL
 
@@ -23,7 +23,11 @@ class VerificationStore:
         self.switch = True
 
     def push(self, scope):
-        assert scope not in self.store
+        # Allow reusing scope names across tests by clearing old entries
+        if scope in self.store:
+            self.store.pop(scope, None)
+        if scope in self.scope:
+            self.scope.remove(scope)
         self.scope.append(scope)
         self.store[scope] = {
             'func_attrs' : dict(),
@@ -59,7 +63,10 @@ class VerificationStore:
         if self.switch:
             try:
                 while self.scope:
-                    self.verify(self.scope.pop(), ignore_err)
+                    current = self.scope.pop()
+                    self.verify(current, ignore_err)
+                    # Drop verified scope to avoid stale entries across runs
+                    self.store.pop(current, None)
             except Exception as e:
                 if not ignore_err:
                     raise e
@@ -110,6 +117,18 @@ def verify_all(ignore_err : bool=True):
 
 def invariant(inv):
     return parse_assertion(inv)
+
+def decreases(measure):
+    """
+    Parse a decreases expression used for termination annotations.
+
+    This is a lightweight helper so users can write `decreases('n')` in code,
+    similar to `invariant('...')`. The core VC engine may choose to use (or
+    ignore) this annotation depending on enabled features.
+    """
+    if measure is None:
+        return None
+    return parse_expr(measure if isinstance(measure, str) else str(measure))
 
 def assume(C):
     if not C:
@@ -232,6 +251,10 @@ def generate_refinement_constraints(sigma: dict, func_sigma: dict):
 
 def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=None):
     code = inspect.getsource(func)
+    # Many users define @verify functions nested inside other functions/methods
+    # (e.g., inside a unittest method). Dedent so ast.parse succeeds.
+    import textwrap
+    code = textwrap.dedent(code)
     func_ast = ast.parse(code)
     target_language_ast = StmtTranslator().visit(func_ast)
     func_attrs = STORE.get_func_attrs(scope, func.__name__)
