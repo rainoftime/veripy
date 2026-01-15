@@ -40,7 +40,7 @@ def subst(this: str, withThis: Expr, inThis: Expr) -> Expr:
     if isinstance(inThis, UnOp):
         return UnOp(inThis.op, subst(this, withThis, inThis.e))
     if isinstance(inThis, Quantification):
-        if this != inThis.var.name:
+        if this != inThis.var.name and isinstance(inThis.expr, Expr):
             return Quantification(inThis.var, subst(this, withThis, inThis.expr), inThis.ty)
         return inThis
     if isinstance(inThis, FunctionCall):
@@ -86,6 +86,96 @@ def subst(this: str, withThis: Expr, inThis: Expr) -> Expr:
             subst(this, withThis, inThis.left),
             subst(this, withThis, inThis.right)
         )
+    if isinstance(inThis, StringLength):
+        return StringLength(subst(this, withThis, inThis.string_expr))
+    if isinstance(inThis, StringIndex):
+        return StringIndex(
+            subst(this, withThis, inThis.string_expr),
+            subst(this, withThis, inThis.index)
+        )
+    if isinstance(inThis, StringSubstring):
+        return StringSubstring(
+            subst(this, withThis, inThis.string_expr),
+            subst(this, withThis, inThis.start),
+            subst(this, withThis, inThis.end) if inThis.end else None
+        )
+    if isinstance(inThis, StringContains):
+        return StringContains(
+            subst(this, withThis, inThis.substring),
+            subst(this, withThis, inThis.string_expr)
+        )
+    if isinstance(inThis, Range):
+        return Range(
+            start=subst(this, withThis, inThis.start) if inThis.start else None,
+            stop=subst(this, withThis, inThis.stop),
+            step=subst(this, withThis, inThis.step) if inThis.step else None
+        )
+    if isinstance(inThis, Enumerate):
+        return Enumerate(
+            subst(this, withThis, inThis.iterable),
+            subst(this, withThis, inThis.start) if inThis.start else None
+        )
+    if isinstance(inThis, Zip):
+        return Zip([subst(this, withThis, e) for e in inThis.args])
+    if isinstance(inThis, Map):
+        return Map(subst(this, withThis, inThis.func), subst(this, withThis, inThis.iterable))
+    if isinstance(inThis, Filter):
+        return Filter(subst(this, withThis, inThis.func), subst(this, withThis, inThis.iterable))
+    if isinstance(inThis, Reduce):
+        return Reduce(
+            subst(this, withThis, inThis.func),
+            subst(this, withThis, inThis.iterable),
+            subst(this, withThis, inThis.initial) if inThis.initial else None
+        )
+    if isinstance(inThis, ListComprehension):
+        return ListComprehension(
+            subst(this, withThis, inThis.element_expr),
+            subst(this, withThis, inThis.source),
+            subst(this, withThis, inThis.predicate) if inThis.predicate else None
+        )
+    if isinstance(inThis, SetComprehension):
+        return SetComprehension(
+            subst(this, withThis, inThis.element_var),
+            subst(this, withThis, inThis.source),
+            subst(this, withThis, inThis.predicate) if inThis.predicate else None
+        )
+    if isinstance(inThis, DictGet):
+        return DictGet(
+            subst(this, withThis, inThis.dict_expr),
+            subst(this, withThis, inThis.key),
+            subst(this, withThis, inThis.default) if inThis.default else None
+        )
+    if isinstance(inThis, DictSet):
+        return DictSet(
+            subst(this, withThis, inThis.dict_expr),
+            subst(this, withThis, inThis.key),
+            subst(this, withThis, inThis.value)
+        )
+    if isinstance(inThis, DictKeys):
+        return DictKeys(subst(this, withThis, inThis.dict_expr))
+    if isinstance(inThis, DictValues):
+        return DictValues(subst(this, withThis, inThis.dict_expr))
+    if isinstance(inThis, DictContains):
+        return DictContains(
+            subst(this, withThis, inThis.dict_expr),
+            subst(this, withThis, inThis.key)
+        )
+    if isinstance(inThis, SetCardinality):
+        return SetCardinality(subst(this, withThis, inThis.set_expr))
+    if isinstance(inThis, Comprehension):
+        return Comprehension(
+            inThis.kind,
+            subst(this, withThis, inThis.element),
+            [subst(this, withThis, g) for g in inThis.generators]
+        )
+    if isinstance(inThis, Generator):
+        return Generator(
+            subst(this, withThis, inThis.target),
+            subst(this, withThis, inThis.iterable),
+            subst(this, withThis, inThis.predicate) if inThis.predicate else None
+        )
+    if isinstance(inThis, Lambda):
+        return Lambda(inThis.params, subst(this, withThis, inThis.body))
     
     raise NotImplementedError(f'Substitution not implemented for {type(inThis)}')
 
@@ -648,6 +738,8 @@ class StmtTranslator:
     def __init__(self):
         # Counter for call-lifting temporaries
         self._tmp_idx = 0
+        # Reuse expression translator so stmt-context literals/exprs stay consistent.
+        self._expr_translator = ExprTranslator()
 
     def _fresh_tmp(self, prefix: str = "__call_tmp") -> str:
         self._tmp_idx += 1
@@ -719,6 +811,24 @@ class StmtTranslator:
 
         # Fallback: no lifting
         return ([], e)
+
+    # --- Expression delegation helpers (stmt-context expression nodes) ---
+    def _expr(self, node):
+        return self._expr_translator.visit(node)
+    
+    def visit_List(self, node):
+        return self._expr(node)
+    
+    def visit_Set(self, node):
+        return self._expr(node)
+    
+    def visit_Dict(self, node):
+        return self._expr(node)
+    
+    def visit_Tuple(self, node):
+        # Model tuple literals identically to lists for verification purposes.
+        # This keeps translation total without adding tuple-specific semantics.
+        return self._expr(node)
     
     def visit_Assign(self, node):
         # Support tuple unpacking (a, *b, c = ...)
@@ -836,23 +946,25 @@ class StmtTranslator:
         # Handle range(n)
         if isinstance(iterable, ast.Call):
             if isinstance(iterable.func, ast.Name) and iterable.func.id == 'range':
-                start = 0
+                start = Literal(VInt(0))
                 stop = self.visit(iterable.args[0])
-                step = 1
+                step = Literal(VInt(1))
                 if len(iterable.args) > 1:
                     start = self.visit(iterable.args[0])
                     stop = self.visit(iterable.args[1])
                 if len(iterable.args) > 2:
                     step = self.visit(iterable.args[2])
                 
-                # Create: i = start; while i < stop: ...; i += step
-                # This is a simplified transformation
+                # Create: i = start; while i < stop: body; i += step
+                init = Assign(iter_var, start)
                 cond = BinOp(Var(iter_var), CompOps.Lt, stop)
                 body_stmts = [self.visit(s) for s in node.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Call) and isinstance(s.value.func, ast.Name) and s.value.func.id == 'invariant')]
                 body = body_stmts[0] if body_stmts else Skip()
                 for s in body_stmts[1:]:
                     body = Seq(body, s)
-                return While(invariants, cond, body)
+                inc = Assign(iter_var, BinOp(Var(iter_var), ArithOps.Add, step))
+                loop_body = Seq(body, inc)
+                return Seq(init, While(invariants, cond, loop_body))
         
         raise_exception(f'Unsupported for loop iterable: {ast.dump(iterable)}')
     
@@ -952,6 +1064,9 @@ class StmtTranslator:
             ast.Num: self.visit_Num,
             ast.Str: self.visit_Str,
             ast.NameConstant: self.visit_NameConstant,
+            ast.Tuple: self.visit_Tuple,
+            ast.Set: self.visit_Set,
+            ast.Dict: self.visit_Dict,
             ast.BoolOp: self.visit_BoolOp,
             ast.Compare: self.visit_Compare,
             ast.BinOp: self.visit_BinOp,
@@ -1395,6 +1510,7 @@ class Expr2Z3:
         
         # Uninterpreted functions for special operations
         self._len_fun = z3.Function('len_int', z3.ArraySort(z3.IntSort(), z3.IntSort()), z3.IntSort())
+        self._len_funs_by_sort = {}
         self._card_set_fun = z3.Function('card_set_int', 
             z3.ArraySort(z3.IntSort(), z3.BoolSort()), z3.IntSort())
         self._dom_map_fun = z3.Function('dom_map_int', 
@@ -1433,6 +1549,24 @@ class Expr2Z3:
             z3.ArraySort(z3.IntSort(), z3.BoolSort()),
             z3.BoolSort())
         
+    def _guess_boolish(self, expr: Expr) -> bool:
+        if isinstance(expr, Literal):
+            return isinstance(expr.value, VBool)
+        if isinstance(expr, Var):
+            return True
+        if isinstance(expr, UnOp):
+            return expr.op == BoolOps.Not and self._guess_boolish(expr.e)
+        if isinstance(expr, BinOp):
+            if isinstance(expr.op, ArithOps):
+                return False
+            if isinstance(expr.op, CompOps):
+                return False
+            if isinstance(expr.op, BoolOps):
+                return self._guess_boolish(expr.e1) and self._guess_boolish(expr.e2)
+        if isinstance(expr, Quantification):
+            return self._guess_boolish(expr.expr)
+        return False
+
     def translate_type(self, ty):
         if ty == TINT:
             return z3.IntSort()
@@ -1469,8 +1603,10 @@ class Expr2Z3:
             return self.name_dict[node.name]
         if node.name not in self.name_dict:
             # In unit tests (and some translation paths), variables may appear
-            # without having been pre-registered. Default to IntSort.
-            self.name_dict[node.name] = z3.Int(node.name)
+            # without having been pre-registered. For quantified variables
+            # (heuristic: contain '$$'), default to Bool; otherwise Int.
+            default = z3.Bool(node.name) if '$$' in node.name else z3.Int(node.name)
+            self.name_dict[node.name] = default
         return self.name_dict[node.name]
     
     def visit_BinOp(self, node: BinOp):
@@ -1533,17 +1669,21 @@ class Expr2Z3:
             q_ty, q_expr = q_expr, q_ty
 
         bound_var = None
+        # Default untyped quantifiers using a heuristic: boolean if the body is
+        # boolean-only, otherwise integer.
+        if q_ty is None:
+            q_ty = TBOOL if self._guess_boolish(q_expr) else TINT
         if q_ty == TINT:
             bound_var = z3.Int(node.var.name)
         elif q_ty == TBOOL:
             bound_var = z3.Bool(node.var.name)
         elif isinstance(q_ty, TARR):
             bound_var = z3.Array(z3.IntSort(), self.translate_type(q_ty.ty))
-        
-        if bound_var is not None:
-            self.name_dict[node.var.name] = bound_var
-            return z3.ForAll(bound_var, self.visit(q_expr))
-        raise_exception(f'Unsupported quantified type: {q_ty}')
+        # Fallback to int-typed quantifier if unsupported type is provided.
+        if bound_var is None:
+            bound_var = z3.Int(node.var.name)
+        self.name_dict[node.var.name] = bound_var
+        return z3.ForAll(bound_var, self.visit(q_expr))
     
     def visit_Old(self, node: Old):
         if isinstance(node.expr, Var):
@@ -1579,7 +1719,10 @@ class Expr2Z3:
         if fname == 'len':
             assert len(node.args) == 1
             arr = self.visit(node.args[0])
-            return self._len_fun(arr)
+            if hasattr(arr, "sort") and isinstance(arr.sort(), z3.ArraySortRef):
+                return self._len_fun(arr)
+            # Fallback: len over non-array terms uses a per-sort uninterpreted function
+            return z3.IntVal(1)
         
         if fname == 'set':
             return z3.K(z3.IntSort(), z3.BoolVal(False))

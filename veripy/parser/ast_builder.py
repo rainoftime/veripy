@@ -1,6 +1,37 @@
 from veripy.parser import syntax
 from veripy.typecheck.types import to_ast_type
 
+# Minimal substitution helper to avoid external dependencies and import cycles.
+def _subst_expr(this: str, with_this, expr):
+    if isinstance(expr, syntax.Var):
+        return with_this if expr.name == this else expr
+    if isinstance(expr, syntax.BinOp):
+        return syntax.BinOp(_subst_expr(this, with_this, expr.e1), expr.op, _subst_expr(this, with_this, expr.e2))
+    if isinstance(expr, syntax.UnOp):
+        return syntax.UnOp(expr.op, _subst_expr(this, with_this, expr.e))
+    if isinstance(expr, syntax.Literal):
+        return expr
+    if isinstance(expr, syntax.FunctionCall):
+        fn = expr.func_name
+        if isinstance(fn, syntax.Expr):
+            fn = _subst_expr(this, with_this, fn)
+        return syntax.FunctionCall(fn, [_subst_expr(this, with_this, a) for a in expr.args], native=getattr(expr, "native", True))
+    if isinstance(expr, syntax.Subscript):
+        return syntax.Subscript(_subst_expr(this, with_this, expr.var), _subst_expr(this, with_this, expr.subscript))
+    if isinstance(expr, syntax.Store):
+        return syntax.Store(_subst_expr(this, with_this, expr.arr), _subst_expr(this, with_this, expr.idx), _subst_expr(this, with_this, expr.val))
+    if isinstance(expr, syntax.Quantification):
+        # Shadowing: do not substitute inside if bound variable matches target.
+        if expr.var.name == this:
+            return expr
+        return syntax.Quantification(expr.var, expr.ty, _subst_expr(this, with_this, expr.expr))
+    if isinstance(expr, syntax.SetLiteral):
+        return syntax.SetLiteral([_subst_expr(this, with_this, e) for e in expr.elements])
+    if isinstance(expr, syntax.DictLiteral):
+        return syntax.DictLiteral([_subst_expr(this, with_this, k) for k in expr.keys],
+                                  [_subst_expr(this, with_this, v) for v in expr.values])
+    return expr
+
 ArithOps = syntax.ArithOps
 CompOps = syntax.CompOps
 BoolOps = syntax.BoolOps
@@ -134,7 +165,6 @@ class ProcessQuantification(ASTBuilder):
         self.value = tokens
     
     def makeAST(self):
-        from efmc.veripy import transformer as trans
         ty = None
         if len(self.value) == 3:
             quantifier, var, expr = self.value
@@ -146,11 +176,10 @@ class ProcessQuantification(ASTBuilder):
 
         ori = var.makeAST()
         bounded = syntax.Var(ori.name + '$$0')
-        e = trans.subst(ori.name, bounded, expr.makeAST())
+        e = _subst_expr(ori.name, bounded, expr.makeAST())
         if quantifier == 'exists':
             # exists x. Q <==> not forall x. not Q
             return syntax.UnOp(BoolOps.Not,
-                        syntax.Quantification(bounded,
-                                                syntax.UnOp(BoolOps.Not, e), ty=ty))
+                        syntax.Quantification(bounded, ty, syntax.UnOp(BoolOps.Not, e)))
         else:
-            return syntax.Quantification(bounded, e, ty=ty)
+            return syntax.Quantification(bounded, ty, e)

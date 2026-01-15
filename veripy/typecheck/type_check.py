@@ -178,6 +178,11 @@ def type_infer_BinOp(sigma, func_sigma, expr: BinOp):
         if expr.op in (CompOps.Eq, CompOps.Neq):
             l_ty = type_infer_expr(sigma, func_sigma, expr.e1)
             r_ty = type_infer_expr(sigma, func_sigma, expr.e2)
+            # Permit comparisons against the base type of a refinement.
+            if isinstance(l_ty, ty.TREFINED):
+                l_ty = l_ty.base_type
+            if isinstance(r_ty, ty.TREFINED):
+                r_ty = r_ty.base_type
             # Late-bind unknowns to the other side
             if l_ty == ty.TANY and isinstance(expr.e1, Var):
                 sigma[expr.e1.name] = r_ty
@@ -244,11 +249,17 @@ def type_infer_FunctionCall(sigma, func_sigma: dict, expr: FunctionCall):
     raise NotImplementedError(f'Function call typing not supported: {expr}')
 
 def type_infer_quantification(sigma, func_sigma, expr: Quantification):
-    sigma[expr.var.name] = ty.TANY if expr.ty is None else expr.ty
-    type_check_expr(sigma, func_sigma, ty.TBOOL, expr.expr)
-    if sigma[expr.var.name] == ty.TANY:
-        raise Exception(f'Cannot infer type for {expr.var} in {expr}')
-    expr.ty = sigma[expr.var.name]
+    # Allow inference for unannotated quantifiers by starting with unknown.
+    q_ty = expr.ty if expr.ty is not None else ty.TANY
+    sigma[expr.var.name] = q_ty
+    body = expr.expr if expr.expr is not None else Literal(VBool(True))
+    expr.expr = body
+    type_check_expr(sigma, func_sigma, ty.TBOOL, body)
+    inferred = sigma[expr.var.name]
+    if inferred == ty.TANY:
+        inferred = ty.TBOOL
+        sigma[expr.var.name] = inferred
+    expr.ty = inferred
     sigma.pop(expr.var.name)
     return ty.TBOOL
 

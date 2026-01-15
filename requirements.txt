@@ -2,5 +2,6 @@ z3-solver
 pyparsing
 pytest
 pytest-cov
+pytest-timeout
 apronpy
 rich
