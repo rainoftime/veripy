@@ -2,5 +2,6 @@ from veripy.typecheck.type_check import (type_check_expr, type_infer_expr, type_
 
 __all__ = [
     'types',
-    'type_check'
+    'type_check',
+    'refinement'
 ]

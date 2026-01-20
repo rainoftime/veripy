@@ -1,7 +1,7 @@
 import unittest
 import veripy as vp
 from veripy import verify, invariant
-from veripy.refinement import Refined, PositiveInt, NonNegativeInt, EvenInt, RangeInt, NonEmptyList
+from veripy.typecheck.refinement import Refined, PositiveInt, NonNegativeInt, EvenInt, RangeInt, NonEmptyList
 from typing import List
 
 

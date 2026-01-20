@@ -584,7 +584,7 @@ def parse_func_types(func, inputs=[]):
             if isinstance(ann, ast.Call) and isinstance(ann.func, ast.Name):
                 ctor_name = ann.func.id
                 try:
-                    from veripy import refinement as refinement_mod
+                    from veripy.typecheck import refinement as refinement_mod
                     ctor_map = {
                         'PositiveInt': refinement_mod.PositiveInt,
                         'NonNegativeInt': refinement_mod.NonNegativeInt,
