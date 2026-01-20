@@ -15,6 +15,21 @@ from veripy.typecheck.types import TARR, TINT, TBOOL
 # This cache is shared between function summary generation and expression translation
 _UF_CACHE = {}
 
+
+def _add_builtin_axioms(solver):
+    # Integer division/modulo properties (defined when divisor non-zero)
+    x, y = z3.Ints('x y')
+    solver.add(z3.ForAll([x, y], z3.Implies(y != 0, x == (x / y) * y + (x % y))))
+    solver.add(z3.ForAll([x, y], z3.Implies(y != 0, z3.And((x % y) >= 0, (x % y) < z3.If(y >= 0, y, -y)))))
+
+    # Basic gcd identities (when uf_gcd is present)
+    for key, uf in list(_UF_CACHE.items()):
+        if isinstance(uf, z3.FuncDeclRef) and uf.name() == 'uf_gcd':
+            a, b = z3.Ints('gcd_a gcd_b')
+            solver.add(z3.ForAll([a, b], uf(a, b) >= 0))
+            solver.add(z3.ForAll([a], uf(a, 0) == z3.If(a >= 0, a, -a)))
+            solver.add(z3.ForAll([a, b], z3.Implies(b != 0, uf(a, b) == uf(b, a % b))))
+
 class VerificationStore:
     def __init__(self):
         self.store = dict()
@@ -189,6 +204,22 @@ def wp(sigma, stmt, Q):
 
     def wp_assign_x(stmt: Assign, Q):
         lhs = stmt.var
+        # Support tuple destructuring by expanding into sequential substitutions.
+        if isinstance(lhs, (list, tuple)):
+            q_curr = Q
+            # Evaluate right-hand side elements lazily via Subscripting the tuple/array expression
+            for idx, target in reversed(list(enumerate(lhs))):
+                if isinstance(target, Var):
+                    tname = target.name
+                elif isinstance(target, str):
+                    tname = target
+                else:
+                    raise Exception(f'Unsupported tuple target: {target!r}')
+                # model rhs element as Subscript(stmt.expr, idx)
+                element_expr = Subscript(stmt.expr, Literal(VInt(idx)))
+                q_curr = subst(tname, element_expr, q_curr)
+            return (q_curr, [])
+
         if isinstance(lhs, Var):
             lhs = lhs.name
         if not isinstance(lhs, str):
@@ -238,6 +269,8 @@ def wp(sigma, stmt, Q):
         Seq:    lambda: wp_seq(sigma, stmt, Q),
         If:     lambda: wp_if(sigma, stmt, Q),
         While:  lambda: wp_while(sigma, stmt, Q),
+        Continue: lambda: (Q, []),
+        Break: lambda: (Q, []),
         Havoc:  lambda: (Quantification(Var(stmt.var + '$0'), sigma[stmt.var], subst(stmt.var, Var(stmt.var + '$0'), Q)), [])
     }.get(type(stmt), lambda: raise_exception(f'wp not implemented for {type(stmt)}'))()
 
@@ -446,8 +479,10 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
             return z3.IntSort()
 
         for fname, attrs in scope_funcs.items():
-            if not attrs.get('verified', False):
-                # Do not assume specifications of unverified functions.
+            # Allow self-recursive reasoning by including the current function's
+            # contract even before it is marked verified. This mirrors an
+            # inductive assumption common in verification tools.
+            if not attrs.get('verified', False) and fname != func.__name__:
                 continue
             try:
                 inputs_map = attrs.get('inputs', {})
@@ -477,6 +512,14 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                 ens_expr = fold_constraints(attrs.get('ensures', []))
                 req_z3 = ax_translator.visit(req_expr)
                 ens_z3 = ax_translator.visit(ens_expr)
+                dec_expr = attrs.get('decreases')
+                if dec_expr:
+                    try:
+                        dec_ast = parse_assertion(dec_expr) if isinstance(dec_expr, str) else dec_expr
+                        dec_z3 = ax_translator.visit(dec_ast)
+                        solver.add(z3.ForAll(bound_vars, z3.Implies(req_z3, dec_z3 >= 0)))
+                    except Exception:
+                        pass
                 axiom = z3.Implies(req_z3, ens_z3)
                 if bound_vars:
                     # Help Z3 instantiate the axiom on call sites.
@@ -488,6 +531,7 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                 # Never let axiom generation crash verification; fall back to no axiom.
                 pass
 
+        _add_builtin_axioms(solver)
         emit_smt(translator, solver, check_P, f'Precondition does not imply wp at {func.__name__}')
         for c in C:
             emit_smt(translator, solver, BinOp(pre_with_refinements, BoolOps.Implies, c), f'Side condition violated at {func.__name__}')

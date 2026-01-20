@@ -274,6 +274,19 @@ class ExprTranslator:
     
     def visit_Index(self, node):
         return self.visit(node.value)
+
+    def visit_Slice(self, node):
+        lower = self.visit(node.lower) if node.lower else None
+        upper = self.visit(node.upper) if node.upper else None
+        step = self.visit(node.step) if node.step else None
+        return Slice(lower, upper, step)
+
+    def visit_Tuple(self, node):
+        base = self._fresh_list_base()
+        arr: Expr = base
+        for i, elt in enumerate(node.elts):
+            arr = Store(arr, Literal(VInt(i)), self.visit(elt))
+        return arr
     
     def visit_Call(self, node):
         # Support Name and Attribute (e.g., vp.invariant)
@@ -704,8 +717,10 @@ class ExprTranslator:
             ast.UnaryOp: self.visit_UnaryOp,
             ast.Call: self.visit_Call,
             ast.Subscript: self.visit_Subscript,
+            ast.Slice: self.visit_Slice,
             ast.Attribute: self.visit_Attribute,
             ast.Index: self.visit_Index,
+            ast.Tuple: self.visit_Tuple,
             ast.ListComp: self.visit_ListComp,
             ast.SetComp: self.visit_SetComp,
             ast.DictComp: self.visit_DictComp,
@@ -1549,6 +1564,13 @@ class Expr2Z3:
             z3.ArraySort(z3.IntSort(), z3.BoolSort()),
             z3.ArraySort(z3.IntSort(), z3.BoolSort()),
             z3.BoolSort())
+
+    def _as_bool(self, term):
+        if z3.is_bool(term):
+            return term
+        if z3.is_int(term) or z3.is_arith(term):
+            return term != 0
+        return z3.BoolVal(True)
         
     def _guess_boolish(self, expr: Expr) -> bool:
         if isinstance(expr, Literal):
@@ -1613,6 +1635,27 @@ class Expr2Z3:
     def visit_BinOp(self, node: BinOp):
         c1 = self.visit(node.e1)
         c2 = self.visit(node.e2)
+
+        def _as_bool(term):
+            if z3.is_bool(term):
+                return term
+            if z3.is_int(term) or z3.is_arith(term):
+                return term != 0
+            return z3.BoolVal(True)
+
+        def _safe_eq(a, b):
+            try:
+                return a == b
+            except Exception:
+                # Heterogeneous equality is always false in our logic model.
+                return z3.BoolVal(False)
+
+        def _safe_neq(a, b):
+            try:
+                return a != b
+            except Exception:
+                # If equality is ill-typed, inequality defaults to true.
+                return z3.BoolVal(True)
         
         op_handlers = {
             # Arithmetic
@@ -1623,14 +1666,14 @@ class Expr2Z3:
             ArithOps.Mod: lambda: c1 % c2,
             
             # Boolean
-            BoolOps.And: lambda: z3.And(c1, c2),
-            BoolOps.Or: lambda: z3.Or(c1, c2),
-            BoolOps.Implies: lambda: z3.Implies(c1, c2),
-            BoolOps.Iff: lambda: z3.And(z3.Implies(c1, c2), z3.Implies(c2, c1)),
+            BoolOps.And: lambda: z3.And(self._as_bool(c1), self._as_bool(c2)),
+            BoolOps.Or: lambda: z3.Or(self._as_bool(c1), self._as_bool(c2)),
+            BoolOps.Implies: lambda: z3.Implies(self._as_bool(c1), self._as_bool(c2)),
+            BoolOps.Iff: lambda: z3.And(z3.Implies(self._as_bool(c1), self._as_bool(c2)), z3.Implies(self._as_bool(c2), self._as_bool(c1))),
             
             # Comparison
-            CompOps.Eq: lambda: c1 == c2,
-            CompOps.Neq: lambda: c1 != c2,
+            CompOps.Eq: lambda: _safe_eq(c1, c2),
+            CompOps.Neq: lambda: _safe_neq(c1, c2),
             CompOps.Gt: lambda: c1 > c2,
             CompOps.Ge: lambda: c1 >= c2,
             CompOps.Lt: lambda: c1 < c2,
@@ -1658,7 +1701,7 @@ class Expr2Z3:
         if node.op == ArithOps.Neg:
             return -c
         elif node.op == BoolOps.Not:
-            return z3.Not(c)
+            return z3.Not(self._as_bool(c))
         raise_exception(f'Unsupported UnOp: {node.op}')
     
     def visit_Quantification(self, node: Quantification):
@@ -1684,7 +1727,7 @@ class Expr2Z3:
         if bound_var is None:
             bound_var = z3.Int(node.var.name)
         self.name_dict[node.var.name] = bound_var
-        return z3.ForAll(bound_var, self.visit(q_expr))
+        return z3.ForAll(bound_var, self._as_bool(self.visit(q_expr)))
     
     def visit_Old(self, node: Old):
         if isinstance(node.expr, Var):

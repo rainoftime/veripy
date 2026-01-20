@@ -1,33 +1,121 @@
 # Unit Tests
 
-This directory contains unit tests for the veripy verification system. Each test file focuses on a specific aspect of verification functionality.
+This directory contains unit tests for the veripy verification system, organized into logical subdirectories by feature area.
 
-## Test Files
+## Directory Structure
 
-- `test_arrays.py` - Tests for array operations and verification
-- `test_calls.py` - Tests for function calls and recursive functions
-- `test_counter.py` - Tests for counter function with invariants
-- `test_decreases.py` - Tests for functions with decreases clauses
-- `test_frames.py` - Tests for frame conditions and modifies clauses
-- `test_loops.py` - Tests for loop verification with invariants
-- `test_quantifiers.py` - Tests for quantifier verification
-- `test_structures.py` - Tests for data structures verification
+### `language_features/`
+Tests for Python language features and syntax:
+- Comprehensions (list, dict, set)
+- Lambdas
+- Decorators
+- Async/await
+- Match statements
+- Walrus operator (`:=`)
+- F-strings
+- Context managers
+- Generators
+- Imports
+- Scopes
+- Variable arguments
+- Exceptions
+- Functions
+
+### `data_types/`
+Tests for data type operations and verification:
+- Arrays and array manipulation
+- Dictionaries (operations and expressions)
+- Sets (operations and expressions)
+- Strings (operations and expressions)
+- Dataclasses
+- Classes
+- Structures
+- General data type tests
+
+### `control_flow/`
+Tests for control flow constructs:
+- Loops (while, for)
+- General control flow
+- Iteration
+- Loop invariants
+- Loop control (break, continue)
+
+### `verification/`
+Tests for verification-specific features:
+- Quantifiers (basic, advanced, comprehensive)
+- Refinement types
+- Termination checking
+- Decreases clauses
+- Frames and frame conditions
+- Lemmas
+
+### `expressions/`
+Tests for expressions and operations:
+- General expressions
+- Builtin functions
+- Function calls
+- Method calls
+- Field access
+- OOP expressions
+- Statements
+- Augmented assignments
+- Bit manipulation
+- Mathematical properties
+
+### `algorithms/`
+Tests for algorithm implementations:
+- Sorting algorithms
+- Search algorithms
+- String algorithms
+- Prefix sum
+- Two pointers
+
+### `core/`
+Tests for core system functionality:
+- Type system
+- Error reporting
+- Auto-active engine
+- Auto-active integration
+- Z3 translation
+- Builtin translation
+- Syntax exports
+
+### `integration/`
+Integration tests:
+- Expression integration
+- Extended combinations
+- Automatic inference
+
+### `edge_cases/`
+Edge cases and miscellaneous tests:
+- Edge cases
+- Test cases
+- Prototype tests
+- Counter tests
 
 ## Running Tests
 
 To run all unit tests:
 ```bash
-python -m unittest discover tests/unit
+python -m pytest tests/unit
+```
+
+To run tests in a specific subdirectory:
+```bash
+python -m pytest tests/unit/language_features
+python -m pytest tests/unit/data_types
+python -m pytest tests/unit/control_flow
+# etc.
 ```
 
 To run a specific test file:
 ```bash
-python -m unittest tests.unit.test_arrays
+python -m pytest tests/unit/data_types/test_arrays.py
 ```
 
 To run a specific test method:
 ```bash
-python -m unittest tests.unit.test_arrays.TestArrays.test_set_first
+python -m pytest tests/unit/data_types/test_arrays.py::TestArrays::test_set_first
 ```
 
 ## Test Structure

@@ -191,7 +191,8 @@ def type_infer_BinOp(sigma, func_sigma, expr: BinOp):
                 sigma[expr.e2.name] = l_ty
                 r_ty = l_ty
             if l_ty != ty.TANY and r_ty != ty.TANY and l_ty != r_ty:
-                raise TypeError(f'Cannot compare {l_ty} to {r_ty}')
+                # Python permits equality between unlike types; treat as bool without failing type check.
+                return ty.TBOOL
             return ty.TBOOL
 
         # Membership: x in container
@@ -244,8 +245,8 @@ def type_infer_FunctionCall(sigma, func_sigma: dict, expr: FunctionCall):
         if fname in func_sigma:
             fty = func_sigma[fname]['returns'] if isinstance(func_sigma[fname], dict) else func_sigma[fname]
             return fty
-        # Default to int for unknown
-        return ty.TINT
+        # Default to bool for unknown predicate-like calls to align with logical formulas
+        return ty.TBOOL
     raise NotImplementedError(f'Function call typing not supported: {expr}')
 
 def type_infer_quantification(sigma, func_sigma, expr: Quantification):
