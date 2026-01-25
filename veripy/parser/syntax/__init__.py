@@ -44,7 +44,7 @@ __all__ = [
     'StringSubstring', 'StringContains',
     # Core Statements
     'Stmt', 'Skip', 'Assign', 'FieldAssignStmt', 'If', 'Seq', 'Assume',
-    'Assert', 'While', 'Havoc',
+    'Assert', 'While', 'Havoc', 'SubscriptAssignStmt',
     # Extended Statements
     'Try', 'ExceptHandler', 'With', 'ForLoop', 'AugAssign', 'Break',
     'Continue', 'Raise', 'Global', 'Nonlocal', 'ImportStmt', 'ImportFrom',

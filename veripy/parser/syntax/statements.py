@@ -131,3 +131,22 @@ class Havoc(Stmt):
     
     def variables(self):
         return set()
+
+
+class SubscriptAssignStmt(Stmt):
+    """
+    Subscript assignment statement: base[idx] = value.
+
+    This keeps the statement-level mutation explicit so later lowering passes
+    can decide whether it is a list/dict/object update.
+    """
+    def __init__(self, base: Expr, idx: Expr, value: Expr):
+        self.base = base
+        self.idx = idx
+        self.value = value
+
+    def __repr__(self):
+        return f'(SubscriptAssign {self.base}[{self.idx}] = {self.value})'
+
+    def variables(self):
+        return self.base.variables().union(self.idx.variables()).union(self.value.variables())

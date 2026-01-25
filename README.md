@@ -6,6 +6,12 @@ A production-ready auto-active verification system for Python, similar to Dafny 
 
 Veripy transforms Python code verification from a work-in-progress into a production-ready system with automatic invariant inference, comprehensive error reporting, and a professional CLI.
 
+## Soundness note
+
+Veripy is **not sound for full Python** today. The core VC engine is intended to be sound for a restricted, “verification-oriented” subset (roughly: side-effect-free code over `int`/`bool` plus mathematical arrays, with structured `if`/`while`, and user-supplied invariants), and it rejects or approximates many Python features (exceptions, dynamic dispatch, aliasing/mutation semantics of real lists/dicts/objects, etc.).
+
+Recent work is moving toward a Dafny/Boogie-style explicit heap model for **aliasing + mutation** (lists/dicts/fields as references) and for **exception safety** (e.g., bounds and `div/mod` by zero become proof obligations). This is still a work in progress and many Python features remain unsupported.
+
 ## Key Features
 
 ### Auto-Active Verification

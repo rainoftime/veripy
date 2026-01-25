@@ -38,7 +38,9 @@ class Expr2Z3:
         self._listcomp_cache = {}
         
         # Uninterpreted functions for special operations
-        self._len_fun = z3.Function('len_int', z3.ArraySort(z3.IntSort(), z3.IntSort()), z3.IntSort())
+        # Length is intentionally modeled as an uninterpreted function.
+        # We keep one len-function per array sort, so `len` is well-typed for
+        # arrays of different element sorts (e.g., int vs bool).
         self._len_funs_by_sort = {}
         self._card_set_fun = z3.Function('card_set_int', 
             z3.ArraySort(z3.IntSort(), z3.BoolSort()), z3.IntSort())
@@ -108,8 +110,14 @@ class Expr2Z3:
             return z3.IntSort()
         if ty == TBOOL:
             return z3.BoolSort()
-        if isinstance(ty, TARR):
-            return z3.ArraySort(z3.IntSort(), self.translate_type(ty.ty))
+        if ty is str:
+            return z3.StringSort()
+        # In the heap model, Python lists/dicts are references.
+        if isinstance(ty, TARR) or isinstance(ty, TDICT):
+            return z3.IntSort()
+        if isinstance(ty, TSET):
+            # Sets are modeled as characteristic functions.
+            return z3.ArraySort(self.translate_type(ty.elem_ty), z3.BoolSort())
         return z3.IntSort()
     
     def visit_Literal(self, lit: Literal):
@@ -271,15 +279,70 @@ class Expr2Z3:
             fname = str(func_name)
         
         arg_terms = [self.visit(a) for a in node.args]
+
+        def _parse_summary_uf(nm: str):
+            # Expected: __uf_<user_fname>__<out>, where out is either "ans" or a
+            # heap short-name like "heap_list_len".
+            if not nm.startswith("__uf_"):
+                return None
+            rest = nm[len("__uf_") :]
+            if "__" not in rest:
+                return None
+            user_fn, out = rest.rsplit("__", 1)
+            return user_fn, out
+
+        def _sort_from_tag(tag: str):
+            if tag in ("int", "ref"):
+                return z3.IntSort()
+            if tag == "bool":
+                return z3.BoolSort()
+            if tag == "str":
+                return z3.StringSort()
+            raise_exception(f"Unsupported heap tag: {tag}")
+
+        def _heap_sort_from_short(short: str):
+            # short is like "heap_list_len"; reconstruct full heap var name.
+            hv = "__" + short
+            if hv == "__heap_list_len":
+                return z3.ArraySort(z3.IntSort(), z3.IntSort())
+            if hv.startswith("__heap_list_data_"):
+                elem_tag = hv.split("__heap_list_data_", 1)[1]
+                elem_sort = _sort_from_tag(elem_tag)
+                return z3.ArraySort(z3.IntSort(), z3.ArraySort(z3.IntSort(), elem_sort))
+            if hv.startswith("__heap_dict_dom_"):
+                key_tag = hv.split("__heap_dict_dom_", 1)[1]
+                key_sort = _sort_from_tag(key_tag)
+                return z3.ArraySort(z3.IntSort(), z3.ArraySort(key_sort, z3.BoolSort()))
+            if hv.startswith("__heap_dict_map_"):
+                rest = hv.split("__heap_dict_map_", 1)[1]
+                parts = rest.split("_", 1)
+                if len(parts) != 2:
+                    raise_exception(f"Malformed dict heap name: {hv}")
+                key_tag, val_tag = parts
+                key_sort = _sort_from_tag(key_tag)
+                val_sort = _sort_from_tag(val_tag)
+                return z3.ArraySort(z3.IntSort(), z3.ArraySort(key_sort, val_sort))
+            if hv.startswith("__heap_field_"):
+                tag = hv.split("__heap_field_", 1)[1]
+                val_sort = _sort_from_tag(tag)
+                return z3.ArraySort(z3.IntSort(), z3.ArraySort(z3.StringSort(), val_sort))
+            raise_exception(f"Unknown heap short-name: {short}")
         
         # Handle built-in functions
         if fname == 'len':
             assert len(node.args) == 1
             arr = self.visit(node.args[0])
-            if hasattr(arr, "sort") and isinstance(arr.sort(), z3.ArraySortRef):
-                return self._len_fun(arr)
-            # Fallback: len over non-array terms uses a per-sort uninterpreted function
-            return z3.IntVal(1)
+            if not (hasattr(arr, "sort") and isinstance(arr.sort(), z3.ArraySortRef)):
+                raise_exception('len expects an array term')
+            a_sort = arr.sort()
+            len_fun = self._len_funs_by_sort.get(a_sort)
+            if len_fun is None:
+                # Use a stable name derived from the sort to keep debugging readable.
+                # Z3 sorts print without whitespace, so this is safe for identifiers.
+                sort_name = str(a_sort).replace(' ', '_')
+                len_fun = z3.Function(f'len_{sort_name}', a_sort, z3.IntSort())
+                self._len_funs_by_sort[a_sort] = len_fun
+            return len_fun(arr)
         
         if fname == 'set':
             return z3.K(z3.IntSort(), z3.BoolVal(False))
@@ -307,18 +370,29 @@ class Expr2Z3:
             assert len(node.args) == 1
             return z3.StringVal(str(arg_terms[0]))
         
-        # Uninterpreted function/const for user functions
-        ret_sort = self.translate_type(self.func_returns.get(fname, TINT))
+        # Uninterpreted functions/consts for user functions and verifier summaries.
+        summary = _parse_summary_uf(fname)
+        if summary is not None:
+            user_fn, out = summary
+            if out == "ans":
+                ret_sort = self.translate_type(self.func_returns.get(user_fn, TINT))
+            else:
+                ret_sort = _heap_sort_from_short(out)
+            sym_name = fname
+        else:
+            ret_sort = self.translate_type(self.func_returns.get(fname, TINT))
+            sym_name = f'uf_{fname}'
+
         if not arg_terms:
-            key = (f'uf_{fname}', tuple(), ret_sort)
+            key = (sym_name, tuple(), ret_sort)
             if key not in self._uf_cache:
-                self._uf_cache[key] = z3.Const(f'uf_{fname}', ret_sort)
+                self._uf_cache[key] = z3.Const(sym_name, ret_sort)
             return self._uf_cache[key]
 
         arg_sorts = tuple(t.sort() for t in arg_terms)
-        key = (f'uf_{fname}', arg_sorts, ret_sort)
+        key = (sym_name, arg_sorts, ret_sort)
         if key not in self._uf_cache:
-            self._uf_cache[key] = z3.Function(f'uf_{fname}', *arg_sorts, ret_sort)
+            self._uf_cache[key] = z3.Function(sym_name, *arg_sorts, ret_sort)
         uf = self._uf_cache[key]
         return uf(*arg_terms)
     

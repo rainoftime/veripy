@@ -10,6 +10,18 @@ from functools import reduce
 from veripy.core.prettyprint import pretty_print
 from veripy import typecheck as tc
 from veripy.typecheck.types import TARR, TINT, TBOOL
+from veripy.typecheck.type_check import issubtype
+from veripy.core.heap_lowering import (
+    HeapEnv,
+    HeapLowerer,
+    infer_field_tags,
+    global_heap_vars,
+    sorted_heap_vars,
+    heap_short_name,
+    uf_name,
+    contains_heap_placeholders_expr,
+    contains_heap_placeholders_stmt,
+)
 
 # Global cache for uninterpreted functions to ensure consistency across verification
 # This cache is shared between function summary generation and expression translation
@@ -163,6 +175,151 @@ def assume(C):
     if not C:
         raise RuntimeError('Assumption Violation')
 
+
+def _and_expr(a: Expr, b: Expr) -> Expr:
+    if isinstance(a, Literal) and isinstance(a.value, VBool) and bool(a.value.v) is True:
+        return b
+    if isinstance(b, Literal) and isinstance(b.value, VBool) and bool(b.value.v) is True:
+        return a
+    return BinOp(a, BoolOps.And, b)
+
+
+def _safe_eval_expr(expr: Expr) -> Expr:
+    """
+    Safety precondition for evaluating `expr` under Python semantics.
+
+    This is intentionally conservative: if we can't establish safety, we
+    introduce obligations (e.g., bounds, divisor != 0) that callers must prove.
+
+    Notes:
+    - Z3's `div`/`mod` are total; Python raises `ZeroDivisionError`.
+    - Z3 array `select` is total; Python list/dict access can raise. We encode
+      list/dict accesses via heap-lowering and add obligations on those patterns.
+    """
+    obligations: List[Expr] = []
+
+    def add(ob: Expr):
+        obligations.append(ob)
+
+    def rec(e: Expr):
+        if isinstance(e, (Var, Literal, StringLiteral)):
+            return
+        if isinstance(e, UnOp):
+            rec(e.e)
+            return
+        if isinstance(e, BinOp):
+            rec(e.e1)
+            rec(e.e2)
+            if e.op in (ArithOps.IntDiv, ArithOps.Mod):
+                add(BinOp(e.e2, CompOps.Neq, Literal(VInt(0))))
+            return
+        if isinstance(e, FunctionCall):
+            for a in e.args:
+                if isinstance(a, Expr):
+                    rec(a)
+            return
+        if isinstance(e, Subscript):
+            rec(e.var)
+            rec(e.subscript)
+            # Heap-lowered list read: __heap_list_data_*[ref][idx]
+            if isinstance(e.var, Subscript) and isinstance(e.var.var, Var):
+                heap_name = e.var.var.name
+                ref_expr = e.var.subscript
+                idx_expr = e.subscript
+                if heap_name.startswith("__heap_list_data_"):
+                    add(BinOp(idx_expr, CompOps.Ge, Literal(VInt(0))))
+                    add(BinOp(idx_expr, CompOps.Lt, Subscript(Var("__heap_list_len"), ref_expr)))
+                if heap_name.startswith("__heap_dict_map_"):
+                    rest = heap_name.split("__heap_dict_map_", 1)[1]
+                    key_tag = rest.split("_", 1)[0]
+                    dom_name = f"__heap_dict_dom_{key_tag}"
+                    add(Subscript(Subscript(Var(dom_name), ref_expr), idx_expr))
+            return
+        if isinstance(e, Store):
+            rec(e.arr)
+            rec(e.idx)
+            rec(e.val)
+            # Heap-lowered list write row: Store(__heap_list_data_*[ref], idx, val)
+            if isinstance(e.arr, Subscript) and isinstance(e.arr.var, Var):
+                heap_name = e.arr.var.name
+                ref_expr = e.arr.subscript
+                idx_expr = e.idx
+                if heap_name.startswith("__heap_list_data_"):
+                    add(BinOp(idx_expr, CompOps.Ge, Literal(VInt(0))))
+                    add(BinOp(idx_expr, CompOps.Lt, Subscript(Var("__heap_list_len"), ref_expr)))
+            return
+        if isinstance(e, Quantification):
+            if isinstance(e.expr, Expr):
+                rec(e.expr)
+            return
+        if isinstance(e, Old):
+            rec(e.expr)
+            return
+        if isinstance(e, SetLiteral):
+            for x in e.elements:
+                rec(x)
+            return
+        if isinstance(e, DictLiteral):
+            for x in e.keys:
+                rec(x)
+            for x in e.values:
+                rec(x)
+            return
+        if isinstance(e, SetOp):
+            rec(e.left)
+            rec(e.right)
+            return
+        if isinstance(e, DictGet):
+            rec(e.dict_expr)
+            rec(e.key)
+            if e.default:
+                rec(e.default)
+            return
+        if isinstance(e, DictSet):
+            rec(e.dict_expr)
+            rec(e.key)
+            rec(e.value)
+            return
+        if isinstance(e, DictKeys):
+            rec(e.dict_expr)
+            return
+        if isinstance(e, DictValues):
+            rec(e.dict_expr)
+            return
+        if isinstance(e, DictContains):
+            rec(e.dict_expr)
+            rec(e.key)
+            return
+        if isinstance(e, SetCardinality):
+            rec(e.set_expr)
+            return
+        if isinstance(e, FieldAccess):
+            rec(e.obj)
+            return
+        if isinstance(e, MethodCall):
+            rec(e.obj)
+            for a in e.args:
+                rec(a)
+            return
+        if isinstance(e, ListComprehension):
+            rec(e.element_expr)
+            rec(e.iterable)
+            if e.predicate:
+                rec(e.predicate)
+            return
+        if isinstance(e, SetComprehension):
+            rec(e.source)
+            if e.predicate:
+                rec(e.predicate)
+            return
+        raise Exception(f"Safety not implemented for {type(e).__name__}")
+
+    rec(expr)
+    out: Expr = Literal(VBool(True))
+    for ob in obligations:
+        out = _and_expr(out, ob)
+    return out
+
 def wp_seq(sigma, stmt, Q):
     (p2, c2) = wp(sigma, stmt.s2, Q)
     (p1, c1) = wp(sigma, stmt.s1, p2)
@@ -171,13 +328,18 @@ def wp_seq(sigma, stmt, Q):
 def wp_if(sigma, stmt, Q):
     (p1, c1) = wp(sigma, stmt.lb, Q)
     (p2, c2) = wp(sigma, stmt.rb, Q)
+    safe_cond = _safe_eval_expr(stmt.cond)
     return (
         BinOp(
-            BinOp(stmt.cond, BoolOps.Implies, p1),
+            safe_cond,
             BoolOps.And,
             BinOp(
-                UnOp(BoolOps.Not, stmt.cond), BoolOps.Implies, p2
-            )
+                BinOp(stmt.cond, BoolOps.Implies, p1),
+                BoolOps.And,
+                BinOp(
+                    UnOp(BoolOps.Not, stmt.cond), BoolOps.Implies, p2
+                )
+            ),
         ),
         c1 + c2
     )
@@ -190,7 +352,10 @@ def wp_while(sigma, stmt: While, Q):
                       else reduce(lambda i1, i2: BinOp(i1, BoolOps.And, i2), invars)
     (p, c) = wp(sigma, s, combined_invars)
     # Optional termination side condition: not yet, but place holder here
+    safe_cond = _safe_eval_expr(cond)
+    safe_cond_obl = BinOp(combined_invars, BoolOps.Implies, safe_cond)
     return (combined_invars, c + [
+        safe_cond_obl,
         BinOp(BinOp(combined_invars, BoolOps.And, cond), BoolOps.Implies, p),
         BinOp(BinOp(combined_invars, BoolOps.And, (UnOp(BoolOps.Not, cond))), BoolOps.Implies, Q)
     ])
@@ -201,6 +366,80 @@ def wp(sigma, stmt, Q):
         for k, v in mapping.items():
             result = subst(k, v, result)
         return result
+
+    def subst_many_simultaneous(expr: Expr, mapping: dict) -> Expr:
+        """
+        Simultaneously substitute variables (by name) within `expr`.
+
+        Sequential substitution is unsound for function calls that produce new
+        heap values, because UF applications must take the *pre*-heaps as
+        arguments (not heaps already substituted to post-state).
+        """
+        def go(e: Expr, bound: set[str]) -> Expr:
+            if isinstance(e, Var):
+                if e.name in bound:
+                    return e
+                repl = mapping.get(e.name)
+                return repl if repl is not None else e
+            if isinstance(e, (Literal, StringLiteral)):
+                return e
+            if isinstance(e, UnOp):
+                return UnOp(e.op, go(e.e, bound))
+            if isinstance(e, BinOp):
+                return BinOp(go(e.e1, bound), e.op, go(e.e2, bound))
+            if isinstance(e, Subscript):
+                return Subscript(go(e.var, bound), go(e.subscript, bound))
+            if isinstance(e, Store):
+                return Store(go(e.arr, bound), go(e.idx, bound), go(e.val, bound))
+            if isinstance(e, FunctionCall):
+                fn = e.func_name
+                if isinstance(fn, Expr):
+                    fn = go(fn, bound)
+                return FunctionCall(fn, [go(a, bound) for a in e.args], native=getattr(e, "native", True))
+            if isinstance(e, Quantification):
+                new_bound = set(bound)
+                new_bound.add(e.var.name)
+                return Quantification(e.var, e.ty, go(e.expr, new_bound))
+            if isinstance(e, Old):
+                return Old(go(e.expr, bound))
+            if isinstance(e, SetLiteral):
+                return SetLiteral([go(x, bound) for x in e.elements])
+            if isinstance(e, DictLiteral):
+                return DictLiteral([go(x, bound) for x in e.keys], [go(x, bound) for x in e.values])
+            if isinstance(e, SetOp):
+                return SetOp(go(e.left, bound), e.op, go(e.right, bound))
+            if isinstance(e, SetCardinality):
+                return SetCardinality(go(e.set_expr, bound))
+            if isinstance(e, DictGet):
+                return DictGet(go(e.dict_expr, bound), go(e.key, bound), go(e.default, bound) if e.default else None)
+            if isinstance(e, DictSet):
+                return DictSet(go(e.dict_expr, bound), go(e.key, bound), go(e.value, bound))
+            if isinstance(e, DictKeys):
+                return DictKeys(go(e.dict_expr, bound))
+            if isinstance(e, DictValues):
+                return DictValues(go(e.dict_expr, bound))
+            if isinstance(e, DictContains):
+                return DictContains(go(e.dict_expr, bound), go(e.key, bound))
+            if isinstance(e, ListComprehension):
+                new_bound = set(bound)
+                new_bound.add(e.element_var.name)
+                return ListComprehension(
+                    go(e.element_expr, new_bound),
+                    e.element_var,
+                    go(e.iterable, bound),
+                    go(e.predicate, new_bound) if e.predicate else None,
+                )
+            if isinstance(e, SetComprehension):
+                new_bound = set(bound)
+                new_bound.add(e.element_var.name)
+                return SetComprehension(e.element_var, go(e.source, bound), go(e.predicate, new_bound) if e.predicate else None)
+            if isinstance(e, FieldAccess):
+                return FieldAccess(go(e.obj, bound), e.field)
+            if isinstance(e, MethodCall):
+                return MethodCall(go(e.obj, bound), e.method_name, [go(a, bound) for a in e.args])
+            raise Exception(f"Simultaneous subst not implemented for {type(e).__name__}")
+
+        return go(expr, set())
 
     def wp_assign_x(stmt: Assign, Q):
         lhs = stmt.var
@@ -226,13 +465,16 @@ def wp(sigma, stmt, Q):
             # Fail closed: silently ignoring state updates is unsound.
             raise Exception(f'Unsupported assignment LHS (would be unsound): {stmt.var!r}')
 
+        # Safety for evaluating RHS under Python semantics.
+        safe_rhs = _safe_eval_expr(stmt.expr) if isinstance(stmt.expr, Expr) else Literal(VBool(True))
+
         if isinstance(stmt.expr, FunctionCall) and isinstance(stmt.expr.func_name, Var):
             # best-effort summary: assume callee requires holds; conjoin ensures with ans mapped to LHS
             fname = stmt.expr.func_name.name
             # CURRENT_FUNC_ATTRS is set in verify_func; if absent, fallback to normal assign
             attrs = STORE.func_attrs_global.get(fname)
             if attrs is None:
-                return (subst(lhs, stmt.expr, Q), [])
+                return (_and_expr(safe_rhs, subst(lhs, stmt.expr, Q)), [])
             is_self_call = fname == getattr(STORE, 'current_func', None)
             if is_self_call:
                 STORE.self_call = True
@@ -241,31 +483,41 @@ def wp(sigma, stmt, Q):
             param_names = list(attrs['inputs'].keys())
             arg_exprs = stmt.expr.args
             mapping = { pn: ae for pn, ae in zip(param_names, arg_exprs) }
-            reqs = attrs.get('requires', [])
-            reqs_parsed = [parse_assertion(r) if isinstance(r, str) else r for r in reqs]
-            req_fold = fold_constraints([substitute_many(rp, mapping) for rp in reqs_parsed])
-            ens = attrs.get('ensures', [])
-            ens_parsed = [parse_assertion(e) if isinstance(e, str) else e for e in ens]
-            # Rely on modular function-summary axioms added to the solver
-            # (see below). Substitute the call result directly and require
-            # the callee's precondition at the call site.
-            Q_sub = subst(lhs, stmt.expr, Q)
-            return (BinOp(req_fold, BoolOps.And, Q_sub), [])
+
+            pre_lowered = attrs.get('pre_lowered')
+            if pre_lowered is None:
+                raise Exception(f"Internal error: missing lowered precondition for '{fname}'")
+            req_fold = substitute_many(pre_lowered, mapping)
+
+            heap_names = sorted_heap_vars(global_heap_vars())
+            heap_args = [Var(h) for h in heap_names]
+            uf_args = list(arg_exprs) + heap_args
+
+            call_ans = FunctionCall(Var(uf_name(fname, "ans")), uf_args, native=getattr(stmt.expr, "native", True))
+            call_heap = {
+                h: FunctionCall(Var(uf_name(fname, heap_short_name(h))), uf_args, native=getattr(stmt.expr, "native", True))
+                for h in heap_names
+            }
+
+            subst_map = {lhs: call_ans}
+            subst_map.update(call_heap)
+            Q_sub = subst_many_simultaneous(Q, subst_map)
+            return (_and_expr(safe_rhs, BinOp(req_fold, BoolOps.And, Q_sub)), [])
         
         # Handle refinement type assignments
         base_wp = subst(lhs, stmt.expr, Q)
         if isinstance(stmt.var, str) and lhs in sigma:
             refin_pred = instantiate_refinement(lhs, sigma[lhs])
             if refin_pred is not None:
-                return (BinOp(refin_pred, BoolOps.And, base_wp), [])
+                return (_and_expr(safe_rhs, BinOp(refin_pred, BoolOps.And, base_wp)), [])
         
-        return (base_wp, [])
+        return (_and_expr(safe_rhs, base_wp), [])
 
     return {
         Skip:   lambda: (Q, []),
-        Assume:  lambda: (BinOp(stmt.e, BoolOps.Implies, Q), []),
+        Assume:  lambda: (_and_expr(_safe_eval_expr(stmt.e), BinOp(stmt.e, BoolOps.Implies, Q)), []),
         Assign: lambda: wp_assign_x(stmt, Q),
-        Assert: lambda: (BinOp(Q, BoolOps.And, stmt.e), []),
+        Assert: lambda: (_and_expr(_safe_eval_expr(stmt.e), BinOp(Q, BoolOps.And, stmt.e)), []),
         Seq:    lambda: wp_seq(sigma, stmt, Q),
         If:     lambda: wp_if(sigma, stmt, Q),
         While:  lambda: wp_while(sigma, stmt, Q),
@@ -365,6 +617,9 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
         scope_funcs = STORE.store[scope]['func_attrs']
 
         sigma = tc.type_check_stmt(dict(func_attrs['inputs']), scope_funcs, target_language_ast)
+        # Ensure the function body assigns a return value compatible with the declared return type.
+        if 'ans' in sigma and not issubtype(sigma['ans'], func_attrs['returns']):
+            raise TypeError(f"Return type mismatch: inferred {sigma['ans']} vs declared {func_attrs['returns']}")
 
         # Add refinement predicates from parameter types into the precondition.
         param_ref_preds = []
@@ -404,7 +659,6 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
             if illegal_reads:
                 raise Exception(f'Reads violation: reads {illegal_reads} not in declared reads {set(reads)}')
 
-        (P, C) = wp(sigma, target_language_ast, user_postcond)
         # Treat refinement constraints as assumptions that strengthen the pre-state.
         refinement_constraints = generate_refinement_constraints(sigma, scope_funcs)
         pre_with_refinements = user_precond
@@ -412,6 +666,190 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
             refinement_conj = fold_constraints(refinement_constraints)
             pre_with_refinements = BinOp(pre_with_refinements, BoolOps.And, refinement_conj)
 
+        # Heap lowering: make aliasing/mutation explicit via heap state, and
+        # rewrite list/dict/field operations to read/write the heap.
+        sigma_for_lower = dict(sigma)
+        sigma_for_lower['ans'] = func_attrs['returns']
+        field_tags = infer_field_tags(target_language_ast, sigma_for_lower, scope_funcs)
+        heap_vars = global_heap_vars()
+        lowerer = HeapLowerer(HeapEnv(sigma_for_lower, scope_funcs, field_tags, heap_vars))
+        target_language_ast = lowerer.lower_stmt(target_language_ast)
+        pre_with_refinements = lowerer.lower_expr(pre_with_refinements, rewrite_user_calls=True)
+        user_postcond = lowerer.lower_expr(user_postcond, rewrite_user_calls=True)
+
+        # Require that contracts are well-defined (no Python exceptions) under
+        # the declared precondition.
+        pre_with_refinements = _and_expr(_safe_eval_expr(pre_with_refinements), pre_with_refinements)
+        user_postcond = _and_expr(_safe_eval_expr(user_postcond), user_postcond)
+
+        if contains_heap_placeholders_stmt(target_language_ast) or contains_heap_placeholders_expr(user_postcond):
+            raise Exception("Internal error: heap placeholders remained after lowering")
+
+        # Soundness restriction: effectful calls require heap post-state
+        # substitution. For now we only support calls in the form:
+        #   x = f(...)
+        # where `f` is a verified user function.
+        def _reject_user_calls(stmt: Stmt):
+            def is_user_fn_call(call: FunctionCall) -> bool:
+                if not isinstance(call.func_name, Var):
+                    return False
+                nm = call.func_name.name
+                return nm in scope_funcs and not nm.startswith("__")
+
+            def visit_expr(e: Expr, allow_top_call: bool):
+                if isinstance(e, (Var, Literal, StringLiteral)):
+                    return
+                if isinstance(e, UnOp):
+                    visit_expr(e.e, False)
+                    return
+                if isinstance(e, BinOp):
+                    visit_expr(e.e1, False)
+                    visit_expr(e.e2, False)
+                    return
+                if isinstance(e, Subscript):
+                    visit_expr(e.var, False)
+                    visit_expr(e.subscript, False)
+                    return
+                if isinstance(e, Store):
+                    visit_expr(e.arr, False)
+                    visit_expr(e.idx, False)
+                    visit_expr(e.val, False)
+                    return
+                if isinstance(e, FunctionCall):
+                    if is_user_fn_call(e) and not allow_top_call:
+                        raise Exception("User function calls are only supported as the entire RHS of an assignment (x = f(...))")
+                    # Even when allowed as a top-level call, arguments must not contain calls.
+                    for a in e.args:
+                        if isinstance(a, Expr):
+                            visit_expr(a, False)
+                    return
+                if isinstance(e, Quantification):
+                    visit_expr(e.expr, False)
+                    return
+                if isinstance(e, Old):
+                    visit_expr(e.expr, False)
+                    return
+                if isinstance(e, SetLiteral):
+                    for x in e.elements:
+                        visit_expr(x, False)
+                    return
+                if isinstance(e, DictLiteral):
+                    for x in e.keys:
+                        visit_expr(x, False)
+                    for x in e.values:
+                        visit_expr(x, False)
+                    return
+                if isinstance(e, SetOp):
+                    visit_expr(e.left, False)
+                    visit_expr(e.right, False)
+                    return
+                if isinstance(e, SetCardinality):
+                    visit_expr(e.set_expr, False)
+                    return
+                if isinstance(e, DictGet):
+                    visit_expr(e.dict_expr, False)
+                    visit_expr(e.key, False)
+                    if e.default:
+                        visit_expr(e.default, False)
+                    return
+                if isinstance(e, DictSet):
+                    visit_expr(e.dict_expr, False)
+                    visit_expr(e.key, False)
+                    visit_expr(e.value, False)
+                    return
+                if isinstance(e, DictKeys):
+                    visit_expr(e.dict_expr, False)
+                    return
+                if isinstance(e, DictValues):
+                    visit_expr(e.dict_expr, False)
+                    return
+                if isinstance(e, DictContains):
+                    visit_expr(e.dict_expr, False)
+                    visit_expr(e.key, False)
+                    return
+                if isinstance(e, FieldAccess):
+                    visit_expr(e.obj, False)
+                    return
+                if isinstance(e, MethodCall):
+                    visit_expr(e.obj, False)
+                    for a in e.args:
+                        visit_expr(a, False)
+                    return
+                if isinstance(e, ListComprehension):
+                    visit_expr(e.element_expr, False)
+                    visit_expr(e.iterable, False)
+                    if e.predicate:
+                        visit_expr(e.predicate, False)
+                    return
+                if isinstance(e, SetComprehension):
+                    visit_expr(e.source, False)
+                    if e.predicate:
+                        visit_expr(e.predicate, False)
+                    return
+                raise Exception(f"Call restriction check not implemented for {type(e).__name__}")
+
+            def visit_stmt(s: Stmt):
+                if isinstance(s, Skip):
+                    return
+                if isinstance(s, Seq):
+                    visit_stmt(s.s1)
+                    visit_stmt(s.s2)
+                    return
+                if isinstance(s, If):
+                    visit_expr(s.cond, False)
+                    visit_stmt(s.lb)
+                    visit_stmt(s.rb)
+                    return
+                if isinstance(s, While):
+                    for inv in s.invariants:
+                        visit_expr(inv, False)
+                    visit_expr(s.cond, False)
+                    visit_stmt(s.body)
+                    return
+                if isinstance(s, Assert):
+                    visit_expr(s.e, False)
+                    return
+                if isinstance(s, Assume):
+                    visit_expr(s.e, False)
+                    return
+                if isinstance(s, Assign):
+                    if isinstance(s.expr, Expr):
+                        allow = isinstance(s.expr, FunctionCall) and is_user_fn_call(s.expr)
+                        visit_expr(s.expr, allow)
+                    return
+                if isinstance(s, Havoc):
+                    return
+                if isinstance(s, SubscriptAssignStmt):
+                    # Should not remain after heap lowering.
+                    raise Exception("Internal error: SubscriptAssignStmt remained after heap lowering")
+                if isinstance(s, FieldAssignStmt):
+                    # Should not remain after heap lowering.
+                    raise Exception("Internal error: FieldAssignStmt remained after heap lowering")
+                return
+
+            visit_stmt(stmt)
+
+        _reject_user_calls(target_language_ast)
+
+        # Soundness restriction (Dafny-style): do not allow rebinding parameters.
+        assigned_after_lower = collect_assigned_vars(target_language_ast)
+        rebound = set(func_attrs.get('inputs', {}).keys()).intersection(assigned_after_lower)
+        if rebound:
+            raise Exception(f"Rebinding parameters not supported (treat parameters as immutable): {sorted(rebound)}")
+
+        # Track whether this function writes to the heap (needed to soundly restrict calls).
+        heap_writes = {v for v in collect_assigned_vars(target_language_ast) if isinstance(v, str) and v.startswith("__heap_")}
+        try:
+            STORE.store[scope]['func_attrs'][func.__name__]['heap_writes'] = heap_writes
+            STORE.func_attrs_global[func.__name__]['heap_writes'] = heap_writes
+            STORE.store[scope]['func_attrs'][func.__name__]['pre_lowered'] = pre_with_refinements
+            STORE.store[scope]['func_attrs'][func.__name__]['post_lowered'] = user_postcond
+            STORE.func_attrs_global[func.__name__]['pre_lowered'] = pre_with_refinements
+            STORE.func_attrs_global[func.__name__]['post_lowered'] = user_postcond
+        except Exception:
+            pass
+
+        (P, C) = wp(sigma_for_lower, target_language_ast, user_postcond)
         check_P = BinOp(pre_with_refinements, BoolOps.Implies, P)
 
         # Allow recursive calls even without explicit decreases for now to keep
@@ -420,7 +858,12 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
             pass
 
         solver = z3.Solver()
-        current_consts = declare_consts(sigma)
+        current_consts = declare_consts(sigma_for_lower)
+        # Add heap variables required by the lowered program/contracts.
+        current_consts.update(declare_heap_consts(heap_vars))
+        # Fresh allocation symbols introduced by heap lowering (list/dict literals).
+        for r in getattr(lowerer, "fresh_refs", set()):
+            current_consts.setdefault(r, z3.Int(r))
         # Declare logical result 'ans' for use in postconditions
         ret_ty = func_attrs['returns']
         ret_base_ty = ret_ty.base_type if isinstance(ret_ty, tc.types.TREFINED) else ret_ty
@@ -428,61 +871,194 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
             current_consts['ans'] = z3.Int('ans')
         elif ret_base_ty == tc.types.TBOOL:
             current_consts['ans'] = z3.Bool('ans')
-        elif isinstance(ret_base_ty, tc.types.TARR):
-            # array of ints for now
-            current_consts['ans'] = z3.Array('ans', z3.IntSort(), z3.IntSort())
-        # Build old-state symbols and equate them to current at entry
-        def sort_for(ty):
-            if isinstance(ty, tc.types.TREFINED):
-                ty = ty.base_type
-            if ty == tc.types.TINT:
-                return z3.IntSort()
-            if ty == tc.types.TBOOL:
-                return z3.BoolSort()
-            if isinstance(ty, tc.types.TARR):
-                return z3.ArraySort(z3.IntSort(), sort_for(ty.ty))
-            return z3.IntSort()
-
-        def make_old_const(name, ty):
-            if isinstance(ty, tc.types.TREFINED):
-                ty = ty.base_type
-            if ty == tc.types.TINT:
-                return z3.Int(name + '$old')
-            if ty == tc.types.TBOOL:
-                return z3.Bool(name + '$old')
-            if isinstance(ty, tc.types.TARR):
-                return z3.Array(name + '$old', z3.IntSort(), sort_for(ty.ty))
-            # default to int
-            return z3.Int(name + '$old')
-        old_consts = { name + '$old': make_old_const(name, ty)
-                       for name, ty in sigma.items() if type(ty) != dict }
+        elif isinstance(ret_base_ty, (tc.types.TARR, tc.types.TDICT)):
+            # Heap model: lists/dicts are references.
+            current_consts['ans'] = z3.Int('ans')
+        # Build old-state symbols and equate them to current at entry.
+        old_consts = {}
         for name, const in current_consts.items():
-            if name + '$old' in old_consts:
-                solver.add(old_consts[name + '$old'] == const)
+            old_name = name + '$old'
+            old_consts[old_name] = z3.Const(old_name, const.sort())
+            solver.add(old_consts[old_name] == const)
 
         # Provide function return type map to translator
         def _ret_base(ty):
             return ty.base_type if isinstance(ty, tc.types.TREFINED) else ty
         fn_ret_types = { n: _ret_base(a['returns']) for n, a in scope_funcs.items() }
-        translator = Expr2Z3(current_consts, old_consts, fn_ret_types, _UF_CACHE)
+        translator = Expr2Z3(current_consts, old_consts, fn_ret_types, uf_cache=_UF_CACHE)
 
-        # Add modular function-summary axioms for all known functions in scope.
-        # For each function f(x1..xn) with requires R and ensures E, assert:
-        #   forall x1..xn. R(x) ==> E(x, ans = uf_f(x))
+        # Add modular function-summary axioms for functions that are actually
+        # referenced. Quantifying over heaps is expensive, so avoid adding
+        # axioms that can't affect the current VC.
+        #
+        # Heap-aware summary:
+        # - Return value: `__uf_f__ans(args..., heaps_pre...)`
+        # - Heap post-state: `__uf_f__heap_...(args..., heaps_pre...)`
+        # - Frame: heaps not written by `f` remain equal.
         def _sort_for(ty_):
             if ty_ == tc.types.TINT:
                 return z3.IntSort()
             if ty_ == tc.types.TBOOL:
                 return z3.BoolSort()
-            if isinstance(ty_, tc.types.TARR):
-                return z3.ArraySort(z3.IntSort(), _sort_for(ty_.ty))
+            if isinstance(ty_, (tc.types.TARR, tc.types.TDICT)):
+                return z3.IntSort()
             return z3.IntSort()
+
+        def _parse_summary_root(nm: str) -> str | None:
+            if not nm.startswith("__uf_"):
+                return None
+            rest = nm[len("__uf_") :]
+            if "__" not in rest:
+                return None
+            root, _out = rest.rsplit("__", 1)
+            return root
+
+        def _collect_called_user_funcs_stmt(s: Stmt) -> set[str]:
+            out: set[str] = set()
+
+            def collect_expr(e: Expr):
+                if isinstance(e, (Var, Literal, StringLiteral)):
+                    return
+                if isinstance(e, UnOp):
+                    collect_expr(e.e)
+                    return
+                if isinstance(e, BinOp):
+                    collect_expr(e.e1)
+                    collect_expr(e.e2)
+                    return
+                if isinstance(e, Subscript):
+                    collect_expr(e.var)
+                    collect_expr(e.subscript)
+                    return
+                if isinstance(e, Store):
+                    collect_expr(e.arr)
+                    collect_expr(e.idx)
+                    collect_expr(e.val)
+                    return
+                if isinstance(e, FunctionCall):
+                    if isinstance(e.func_name, Var):
+                        nm = e.func_name.name
+                        if nm in scope_funcs and not nm.startswith("__"):
+                            out.add(nm)
+                        root = _parse_summary_root(nm)
+                        if root is not None:
+                            out.add(root)
+                    for a in e.args:
+                        if isinstance(a, Expr):
+                            collect_expr(a)
+                    return
+                if isinstance(e, Quantification):
+                    collect_expr(e.expr)
+                    return
+                if isinstance(e, Old):
+                    collect_expr(e.expr)
+                    return
+                if isinstance(e, SetLiteral):
+                    for x in e.elements:
+                        collect_expr(x)
+                    return
+                if isinstance(e, DictLiteral):
+                    for x in e.keys:
+                        collect_expr(x)
+                    for x in e.values:
+                        collect_expr(x)
+                    return
+                if isinstance(e, SetOp):
+                    collect_expr(e.left)
+                    collect_expr(e.right)
+                    return
+                if isinstance(e, SetCardinality):
+                    collect_expr(e.set_expr)
+                    return
+                if isinstance(e, DictGet):
+                    collect_expr(e.dict_expr)
+                    collect_expr(e.key)
+                    if e.default:
+                        collect_expr(e.default)
+                    return
+                if isinstance(e, DictSet):
+                    collect_expr(e.dict_expr)
+                    collect_expr(e.key)
+                    collect_expr(e.value)
+                    return
+                if isinstance(e, DictKeys):
+                    collect_expr(e.dict_expr)
+                    return
+                if isinstance(e, DictValues):
+                    collect_expr(e.dict_expr)
+                    return
+                if isinstance(e, DictContains):
+                    collect_expr(e.dict_expr)
+                    collect_expr(e.key)
+                    return
+                if isinstance(e, FieldAccess):
+                    collect_expr(e.obj)
+                    return
+                if isinstance(e, MethodCall):
+                    collect_expr(e.obj)
+                    for a in e.args:
+                        collect_expr(a)
+                    return
+                if isinstance(e, ListComprehension):
+                    collect_expr(e.element_expr)
+                    collect_expr(e.iterable)
+                    if e.predicate:
+                        collect_expr(e.predicate)
+                    return
+                if isinstance(e, SetComprehension):
+                    collect_expr(e.source)
+                    if e.predicate:
+                        collect_expr(e.predicate)
+                    return
+                return
+
+            def collect_stmt(st: Stmt):
+                if isinstance(st, Skip):
+                    return
+                if isinstance(st, Seq):
+                    collect_stmt(st.s1)
+                    collect_stmt(st.s2)
+                    return
+                if isinstance(st, If):
+                    collect_expr(st.cond)
+                    collect_stmt(st.lb)
+                    collect_stmt(st.rb)
+                    return
+                if isinstance(st, While):
+                    for inv in st.invariants:
+                        collect_expr(inv)
+                    collect_expr(st.cond)
+                    collect_stmt(st.body)
+                    return
+                if isinstance(st, Assert):
+                    collect_expr(st.e)
+                    return
+                if isinstance(st, Assume):
+                    collect_expr(st.e)
+                    return
+                if isinstance(st, Assign):
+                    if isinstance(st.expr, Expr):
+                        collect_expr(st.expr)
+                    return
+                if isinstance(st, Havoc):
+                    return
+                return
+
+            collect_stmt(s)
+            return out
+
+        needed_summaries = set()
+        needed_summaries |= _collect_called_user_funcs_stmt(target_language_ast)
+        needed_summaries |= _collect_called_user_funcs_stmt(Assert(pre_with_refinements))
+        needed_summaries |= _collect_called_user_funcs_stmt(Assert(user_postcond))
 
         for fname, attrs in scope_funcs.items():
             # Allow self-recursive reasoning by including the current function's
             # contract even before it is marked verified. This mirrors an
             # inductive assumption common in verification tools.
             if not attrs.get('verified', False) and fname != func.__name__:
+                continue
+            if fname not in needed_summaries:
                 continue
             try:
                 inputs_map = attrs.get('inputs', {})
@@ -493,38 +1069,72 @@ def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=Non
                 in_sorts = [_sort_for(t) for t in param_tys]
                 ret_sort = _sort_for(ret_ty)
                 bound_vars = [z3.Const(n, s) for n, s in zip(param_names, in_sorts)]
-                ax_name_dict = {n: v for n, v in zip(param_names, bound_vars)}
-                if bound_vars:
-                    # Use global cache to ensure consistent uf references
-                    cache_key = (f'uf_{fname}', tuple(in_sorts), ret_sort)
-                    if cache_key in _UF_CACHE:
-                        uf = _UF_CACHE[cache_key]
-                    else:
-                        uf = z3.Function(f'uf_{fname}', *in_sorts, ret_sort)
-                        _UF_CACHE[cache_key] = uf
-                    ax_name_dict['ans'] = uf(*bound_vars)
-                else:
-                    # Nullary function: represent as a constant
-                    ax_name_dict['ans'] = z3.Const(f'uf_{fname}', ret_sort)
+                heap_names = sorted_heap_vars(heap_vars)
+                heap_consts = declare_heap_consts(set(heap_names))
+                heap_bound = [z3.Const(hn, heap_consts[hn].sort()) for hn in heap_names]
 
-                ax_translator = Expr2Z3(ax_name_dict, {}, fn_ret_types, _UF_CACHE)
-                req_expr = fold_constraints(attrs.get('requires', []))
-                ens_expr = fold_constraints(attrs.get('ensures', []))
-                req_z3 = ax_translator.visit(req_expr)
-                ens_z3 = ax_translator.visit(ens_expr)
+                domain_terms = bound_vars + heap_bound
+                domain_sorts = tuple([t.sort() for t in domain_terms])
+
+                def _get_uf(sym: str, out_sort: z3.SortRef):
+                    key = (sym, domain_sorts, out_sort)
+                    uf = _UF_CACHE.get(key)
+                    if uf is None:
+                        uf = z3.Function(sym, *(list(domain_sorts)), out_sort)
+                        _UF_CACHE[key] = uf
+                    return uf
+
+                ans_sym = uf_name(fname, "ans")
+                ans_term = _get_uf(ans_sym, ret_sort)(*domain_terms)
+                heap_post_terms = {}
+                for hn in heap_names:
+                    out_sym = uf_name(fname, heap_short_name(hn))
+                    heap_post_terms[hn] = _get_uf(out_sym, heap_consts[hn].sort())(*domain_terms)
+
+                # Precondition is interpreted in the pre-state.
+                name_dict_pre = {n: v for n, v in zip(param_names, bound_vars)}
+                for hn, hv in zip(heap_names, heap_bound):
+                    name_dict_pre[hn] = hv
+                    name_dict_pre[hn + '$old'] = hv
+                for n, v in zip(param_names, bound_vars):
+                    name_dict_pre[n + '$old'] = v
+
+                # Postcondition is interpreted in the post-state (UF outputs).
+                name_dict_post = dict(name_dict_pre)
+                name_dict_post['ans'] = ans_term
+                for hn in heap_names:
+                    name_dict_post[hn] = heap_post_terms[hn]
+
+                req_expr = attrs.get('pre_lowered')
+                ens_expr = attrs.get('post_lowered')
+                if req_expr is None or ens_expr is None:
+                    raise Exception("Missing lowered contracts")
+                req_z3 = Expr2Z3(name_dict_pre, {}, fn_ret_types, uf_cache=_UF_CACHE).visit(req_expr)
+                ens_z3 = Expr2Z3(name_dict_post, {}, fn_ret_types, uf_cache=_UF_CACHE).visit(ens_expr)
+
+                # Frame: heaps not written by the callee remain equal.
+                frame_eqs = []
+                writes = attrs.get('heap_writes', set()) or set()
+                for hn in heap_names:
+                    if hn not in writes:
+                        frame_eqs.append(heap_post_terms[hn] == name_dict_pre[hn])
+
                 dec_expr = attrs.get('decreases')
                 if dec_expr:
                     try:
                         dec_ast = parse_assertion(dec_expr) if isinstance(dec_expr, str) else dec_expr
-                        dec_z3 = ax_translator.visit(dec_ast)
-                        solver.add(z3.ForAll(bound_vars, z3.Implies(req_z3, dec_z3 >= 0)))
+                        # Termination metric is interpreted in the pre-state.
+                        dec_z3 = Expr2Z3(name_dict_pre, {}, fn_ret_types, uf_cache=_UF_CACHE).visit(dec_ast)
+                        solver.add(z3.ForAll(bound_vars + heap_bound, z3.Implies(req_z3, dec_z3 >= 0)))
                     except Exception:
                         pass
-                axiom = z3.Implies(req_z3, ens_z3)
-                if bound_vars:
+                axiom_body = z3.And(ens_z3, *frame_eqs) if frame_eqs else ens_z3
+                axiom = z3.Implies(req_z3, axiom_body)
+                qvars = bound_vars + heap_bound
+                if qvars:
                     # Help Z3 instantiate the axiom on call sites.
                     # Use a pattern to guide instantiation
-                    solver.add(z3.ForAll(bound_vars, axiom, patterns=[uf(*bound_vars)]))
+                    solver.add(z3.ForAll(qvars, axiom, patterns=[ans_term]))
                 else:
                     solver.add(axiom)
             except Exception:
@@ -550,8 +1160,11 @@ def declare_consts(sigma : dict):
             return z3.IntSort()
         if ty == tc.types.TBOOL:
             return z3.BoolSort()
-        if isinstance(ty, tc.types.TARR):
-            return z3.ArraySort(z3.IntSort(), sort_for(ty.ty))
+        if ty is str:
+            return z3.StringSort()
+        # Heap model: lists/dicts are references.
+        if isinstance(ty, tc.types.TARR) or isinstance(ty, tc.types.TDICT):
+            return z3.IntSort()
         # default to int
         return z3.IntSort()
     for (name, ty) in sigma.items():
@@ -561,10 +1174,66 @@ def declare_consts(sigma : dict):
                 consts[name] = z3.Int(name)
             elif base_ty == tc.types.TBOOL:
                 consts[name] = z3.Bool(name)
-            elif isinstance(base_ty, tc.types.TARR):
-                consts[name] = z3.Array(name, z3.IntSort(), sort_for(base_ty.ty))
+            elif base_ty is str:
+                consts[name] = z3.String(name)
+            elif isinstance(base_ty, tc.types.TARR) or isinstance(base_ty, tc.types.TDICT):
+                consts[name] = z3.Int(name)
             else:
                 consts[name] = z3.Int(name)
+    return consts
+
+
+def _z3_sort_from_tag(tag: str):
+    if tag == "int":
+        return z3.IntSort()
+    if tag == "bool":
+        return z3.BoolSort()
+    if tag == "str":
+        return z3.StringSort()
+    if tag == "ref":
+        return z3.IntSort()
+    # Fail closed rather than guessing a sort.
+    raise Exception(f"Unsupported heap tag: {tag}")
+
+
+def declare_heap_consts(heap_vars: set) -> dict:
+    """
+    Declare Z3 constants for heap variables used by the heap-lowered program.
+
+    See `veripy/core/heap_lowering.py` for the naming scheme.
+    """
+    consts = {}
+    for name in heap_vars:
+        if name == "__heap_list_len":
+            consts[name] = z3.Array(name, z3.IntSort(), z3.IntSort())
+            continue
+        if name.startswith("__heap_list_data_"):
+            elem_tag = name.split("__heap_list_data_", 1)[1]
+            elem_sort = _z3_sort_from_tag(elem_tag)
+            consts[name] = z3.Array(name, z3.IntSort(), z3.ArraySort(z3.IntSort(), elem_sort))
+            continue
+        if name.startswith("__heap_dict_dom_"):
+            key_tag = name.split("__heap_dict_dom_", 1)[1]
+            key_sort = _z3_sort_from_tag(key_tag)
+            consts[name] = z3.Array(name, z3.IntSort(), z3.ArraySort(key_sort, z3.BoolSort()))
+            continue
+        if name.startswith("__heap_dict_map_"):
+            rest = name.split("__heap_dict_map_", 1)[1]
+            parts = rest.split("_", 1)
+            if len(parts) != 2:
+                raise Exception(f"Malformed dict heap name: {name}")
+            key_tag, val_tag = parts
+            key_sort = _z3_sort_from_tag(key_tag)
+            val_sort = _z3_sort_from_tag(val_tag)
+            consts[name] = z3.Array(name, z3.IntSort(), z3.ArraySort(key_sort, val_sort))
+            continue
+        if name.startswith("__heap_field_"):
+            # __heap_field_<tag> : Array[Ref, Array[String, Val]]
+            tag = name.split("__heap_field_", 1)[1]
+            val_sort = _z3_sort_from_tag(tag)
+            consts[name] = z3.Array(name, z3.IntSort(), z3.ArraySort(z3.StringSort(), val_sort))
+            continue
+        raise Exception(f"Unknown heap var name: {name}")
     return consts
 
 def parse_func_types(func, inputs=[]):
@@ -648,6 +1317,11 @@ def collect_assigned_vars(stmt: Stmt) -> set:
         return collect_assigned_vars(stmt.lb).union(collect_assigned_vars(stmt.rb))
     if isinstance(stmt, While):
         return collect_assigned_vars(stmt.body)
+    if isinstance(stmt, SubscriptAssignStmt):
+        # Treat container mutation as a write to the container variable (approximate frame).
+        if isinstance(stmt.base, Var):
+            return {stmt.base.name}
+        return set()
     if isinstance(stmt, Havoc):
         return {stmt.var}
     return set()

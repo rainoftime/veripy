@@ -122,13 +122,28 @@ class StmtTranslator:
                     return t.id
                 return str(t)
             unpack_target = tuple(_tgt(t) for t in node.targets[0].elts)
-            expr = self.visit(node.value) if not isinstance(node.value, ast.List) else self._list_literal_expr(node.value.elts)
+            if isinstance(node.value, ast.List):
+                expr = FunctionCall(Var('__list_lit'), [self.visit(e) for e in node.value.elts])
+            elif isinstance(node.value, ast.Dict):
+                flat = []
+                for k, v in zip(node.value.keys, node.value.values):
+                    flat.append(self.visit(k))
+                    flat.append(self.visit(v))
+                expr = FunctionCall(Var('__dict_lit'), flat)
+            else:
+                expr = self.visit(node.value)
             return Assign(unpack_target, expr)
         else:
             target = self.visit(node.targets[0])
         # Translate RHS (list literals need special handling in statement context).
         if isinstance(node.value, ast.List):
-            expr = self._list_literal_expr(node.value.elts)
+            expr = FunctionCall(Var('__list_lit'), [self.visit(e) for e in node.value.elts])
+        elif isinstance(node.value, ast.Dict):
+            flat = []
+            for k, v in zip(node.value.keys, node.value.values):
+                flat.append(self.visit(k))
+                flat.append(self.visit(v))
+            expr = FunctionCall(Var('__dict_lit'), flat)
         else:
             expr = self.visit(node.value)
         
@@ -138,12 +153,9 @@ class StmtTranslator:
         
         # Check if it's a subscript assignment (arr[i] = value)
         if isinstance(target, Subscript):
-            # Model `a[i] = v` as `a = Store(a, i, v)` when possible, so WP can
-            # substitute array updates correctly.
             base = target.var
             if isinstance(base, Var):
-                return Assign(base.name, Store(base, target.subscript, expr))
-            # Fail closed: skipping updates to complex bases is unsound.
+                return SubscriptAssignStmt(base, target.subscript, expr)
             raise_exception('Unsupported subscript assignment base (must be a variable)')
         
         # Normalize simple assignments to use the variable name (string) as LHS.
@@ -158,13 +170,25 @@ class StmtTranslator:
     def visit_AnnAssign(self, node):
         """Handle annotated assignments: x: int = 5"""
         var = self.visit(node.target)
-        expr = self.visit(node.value) if node.value else None
+        expr = None
+        if node.value is not None:
+            if isinstance(node.value, ast.List):
+                expr = FunctionCall(Var('__list_lit'), [self.visit(e) for e in node.value.elts])
+            elif isinstance(node.value, ast.Dict):
+                flat = []
+                for k, v in zip(node.value.keys, node.value.values):
+                    flat.append(self.visit(k))
+                    flat.append(self.visit(v))
+                expr = FunctionCall(Var('__dict_lit'), flat)
+            else:
+                expr = self.visit(node.value)
         return Assign(var, expr) if expr else Skip()
     
     def visit_If(self, node):
         cond = self.visit(node.test)
-        lb = self.visit(node.body[0]) if node.body else Skip()
-        rb = self.visit(node.orelse[0]) if node.orelse else Skip()
+        # Translate full statement lists for each branch (dropping statements is unsound).
+        lb = self.visit_seq(node.body) if node.body else Skip()
+        rb = self.visit_seq(node.orelse) if node.orelse else Skip()
         return If(cond, lb, rb)
     
     def visit_While(self, node):
@@ -323,8 +347,9 @@ class StmtTranslator:
             return Literal(VInt(node.value))
         elif isinstance(node.value, str):
             return StringLiteral(node.value)
-        else:
-            return Literal(VInt(0))  # Fallback
+        elif node.value is None:
+            return Var('None')
+        raise_exception(f'Unsupported constant: {node.value!r}')
     
     def visit_Num(self, node):
         """Handle numeric literals (Python 3.7 and earlier)."""

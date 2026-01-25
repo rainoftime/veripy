@@ -117,6 +117,20 @@ class ExprTranslator:
         for i, elt in enumerate(node.elts):
             arr = Store(arr, Literal(VInt(i)), self.visit(elt))
         return arr
+
+    def visit_List(self, node):
+        # Represent list literals as a special call so the core verifier can
+        # lower them into heap allocations.
+        elts = [self.visit(e) for e in node.elts]
+        return FunctionCall(Var('__list_lit'), elts)
+
+    def visit_Dict(self, node):
+        # Represent dict literals as a special call: __dict_lit(k1, v1, k2, v2, ...)
+        flat = []
+        for k, v in zip(node.keys, node.values):
+            flat.append(self.visit(k))
+            flat.append(self.visit(v))
+        return FunctionCall(Var('__dict_lit'), flat)
     
     def visit_Call(self, node):
         # Support Name and Attribute (e.g., vp.invariant)

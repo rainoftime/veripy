@@ -49,7 +49,8 @@ class TREFINED(Type):
 def name_to_ast_type(node):
     return {
         'int' : TINT,
-        'bool': TBOOL
+        'bool': TBOOL,
+        'str' : str,
     }.get(node.id, TANY)
 
 def subscript_to_ast_type(node):

@@ -19,7 +19,17 @@ def issubtype(actual, expected):
         return True
     # Arrays are covariant in element type for our purposes
     if isinstance(actual, ty.TARR) and isinstance(expected, ty.TARR):
+        # Treat unknown element type as polymorphic (e.g., [] can be List[int]).
+        if actual.ty == ty.TANY:
+            return True
         return issubtype(actual.ty, expected.ty)
+    # Dicts: covariant in value type, invariant in key type (simplified).
+    if isinstance(actual, ty.TDICT) and isinstance(expected, ty.TDICT):
+        if actual.key_ty != expected.key_ty and actual.key_ty != ty.TANY:
+            return False
+        if actual.val_ty == ty.TANY:
+            return True
+        return issubtype(actual.val_ty, expected.val_ty)
     # Refinement types: {x: T | P1(x)} <: {x: T | P2(x)} if P1(x) ==> P2(x)
     if isinstance(actual, ty.TREFINED) and isinstance(expected, ty.TREFINED):
         if actual.base_type == expected.base_type:
@@ -74,6 +84,17 @@ def type_check_stmt(sigma : dict, func_sigma : dict, stmt : Stmt):
 
         # Unknown LHS shape: still ensure RHS is type-inferable
         return sigma
+    if isinstance(stmt, SubscriptAssignStmt):
+        base_ty = type_infer_expr(sigma, func_sigma, stmt.base)
+        if isinstance(base_ty, ty.TARR):
+            type_check_expr(sigma, func_sigma, ty.TINT, stmt.idx)
+            type_check_expr(sigma, func_sigma, base_ty.ty, stmt.value)
+            return sigma
+        if isinstance(base_ty, ty.TDICT):
+            type_check_expr(sigma, func_sigma, base_ty.key_ty, stmt.idx)
+            type_check_expr(sigma, func_sigma, base_ty.val_ty, stmt.value)
+            return sigma
+        raise TypeError(f'Subscript assignment requires list/dict type, got {base_ty}')
     if isinstance(stmt, FieldAssignStmt):
         type_infer_expr(sigma, func_sigma, stmt.value)
         return sigma
@@ -142,6 +163,9 @@ def type_infer_Subscript(sigma, func_sigma, expr: Subscript):
     obj = expr.var
     obj_ty = type_infer_expr(sigma, func_sigma, obj)
     # index must be int
+    if isinstance(obj_ty, ty.TDICT):
+        type_check_expr(sigma, func_sigma, obj_ty.key_ty, expr.subscript)
+        return obj_ty.val_ty
     type_check_expr(sigma, func_sigma, ty.TINT, expr.subscript)
     if isinstance(obj_ty, ty.TARR):
         return obj_ty.ty
@@ -237,8 +261,40 @@ def type_infer_FunctionCall(sigma, func_sigma: dict, expr: FunctionCall):
     if isinstance(expr.func_name, Var) and expr.func_name.name == 'len':
         if len(expr.args) != 1:
             raise TypeError('len expects exactly one argument')
-        # The argument can be an array or sequence; we return int
+        arg_ty = type_infer_expr(sigma, func_sigma, expr.args[0])
+        # Sound subset: allow len() over lists and dicts (modeled via heap lowering).
+        if not isinstance(arg_ty, (ty.TARR, ty.TDICT)):
+            raise TypeError(f'len expects a list or dict, got {arg_ty}')
         return ty.TINT
+    if isinstance(expr.func_name, Var) and expr.func_name.name == '__list_lit':
+        # List literals are polymorphic. Use element types when present, otherwise unknown.
+        if not expr.args:
+            return ty.TARR(ty.TANY)
+        elem_ty = type_infer_expr(sigma, func_sigma, expr.args[0])
+        for a in expr.args[1:]:
+            t = type_infer_expr(sigma, func_sigma, a)
+            if t != elem_ty:
+                # If elements are mixed, keep it unknown.
+                elem_ty = ty.TANY
+                break
+        return ty.TARR(elem_ty)
+    if isinstance(expr.func_name, Var) and expr.func_name.name == '__dict_lit':
+        # Dict literals are polymorphic. Args come in key/value pairs.
+        if not expr.args:
+            return ty.TDICT(ty.TANY, ty.TANY)
+        if len(expr.args) % 2 != 0:
+            raise TypeError('__dict_lit expects an even number of args (k/v pairs)')
+        key_ty = type_infer_expr(sigma, func_sigma, expr.args[0])
+        val_ty = type_infer_expr(sigma, func_sigma, expr.args[1])
+        # If any pair disagrees, fall back to unknown.
+        for i in range(2, len(expr.args), 2):
+            kt = type_infer_expr(sigma, func_sigma, expr.args[i])
+            vt = type_infer_expr(sigma, func_sigma, expr.args[i + 1])
+            if kt != key_ty:
+                key_ty = ty.TANY
+            if vt != val_ty:
+                val_ty = ty.TANY
+        return ty.TDICT(key_ty, val_ty)
     if isinstance(expr.func_name, Var):
         fname = expr.func_name.name
         # Use provided function typing env if available
