@@ -1,7 +1,28 @@
+"""
+Core Verification Engine for Veripy
+
+This module implements the central verification logic, including:
+1.  **Verification Condition (VC) Generation**: Using Weakest Precondition (WP) calculus.
+2.  **Heap Lowering**: Translating stateful operations (lists, dicts, objects) into explicit heap-passing logic.
+3.  **SMT Interaction**: Interfacing with the Z3 theorem prover to check validity of VCs.
+4.  **Modular Verification**: Verifying functions in isolation using contracts (requires/ensures).
+
+The pipeline for verifying a function is:
+1.  **Parse & Translate**: Python AST -> Veripy AST (`StmtTranslator`).
+2.  **Type Check**: Infer types and check consistency (`type_check_stmt`).
+3.  **Heap Lowering**:
+    -   Identify heap-dependent operations.
+    -   Transform the AST to pass heap variables explicitly.
+    -   Lower list/dict/field accesses to heap reads/writes.
+4.  **WP Generation**: Compute the weakest precondition for the function body with respect to the postcondition.
+5.  **SMT Encoding**: Convert the WP and verification obligations into Z3 constraints.
+6.  **Solving**: Check satisfiability of `Not(VC)`. If UNSAT, the function is verified.
+"""
+
 import ast
 import z3
 import inspect
-from typing import List, Tuple, TypeVar
+from typing import List, Tuple, TypeVar, Dict, Set, Optional, Any, Callable
 from veripy.parser.syntax import *
 from veripy.parser.parser import parse_assertion, parse_expr
 from functools import wraps
@@ -23,12 +44,17 @@ from veripy.core.heap_lowering import (
     contains_heap_placeholders_stmt,
 )
 
+
 # Global cache for uninterpreted functions to ensure consistency across verification
 # This cache is shared between function summary generation and expression translation
 _UF_CACHE = {}
 
 
 def _add_builtin_axioms(solver):
+    """
+    Add axioms for built-in operations that Z3's default theories might not fully cover
+    or where we need specific semantics (e.g., Euclidean division).
+    """
     # Integer division/modulo properties (defined when divisor non-zero)
     x, y = z3.Ints('x y')
     solver.add(z3.ForAll([x, y], z3.Implies(y != 0, x == (x / y) * y + (x % y))))
@@ -43,6 +69,14 @@ def _add_builtin_axioms(solver):
             solver.add(z3.ForAll([a, b], z3.Implies(b != 0, uf(a, b) == uf(b, a % b))))
 
 class VerificationStore:
+    """
+    Manages the state of verification tasks, scopes, and function attributes.
+
+    This class acts as a central registry for:
+    -   **Scopes**: Logical groupings of functions (e.g., modules or test suites).
+    -   **Function Attributes**: Contracts (requires/ensures), types, and verification status.
+    -   **Verification Tasks**: The actual verification callbacks to be executed.
+    """
     def __init__(self):
         self.store = dict()
         self.scope = []
@@ -54,6 +88,7 @@ class VerificationStore:
         self.self_call = False
     
     def enable_verification(self):
+        """Enable the verification process and reset global caches."""
         self.switch = True
         # Clear the uninterpreted function cache when enabling verification
         # to ensure each test starts with a fresh state
@@ -61,6 +96,7 @@ class VerificationStore:
         _UF_CACHE = {}
 
     def push(self, scope):
+        """Enter a new verification scope."""
         # Allow reusing scope names across tests by clearing old entries
         if scope in self.store:
             self.store.pop(scope, None)
@@ -73,16 +109,25 @@ class VerificationStore:
         }
     
     def current_scope(self):
+        """Get the name of the current active scope."""
         if self.scope:
             return self.scope[-1]
     
     def push_verification(self, func_name, verification_func):
+        """Register a verification task (callback) for a function in the current scope."""
         if self.switch:
             if not self.scope:
                 raise Exception('No Scope Defined')
             self.store[self.scope[-1]]['vf'].append((func_name, verification_func))
     
     def verify(self, scope, ignore_err):
+        """
+        Execute all verification tasks in the given scope.
+
+        Args:
+            scope: The name of the scope to verify.
+            ignore_err: If True, suppress exceptions (useful for negative tests).
+        """
         if self.switch and self.store:
             print(f'=> Verifying Scope `{scope}`')
             verifications = self.store[scope]
@@ -99,6 +144,7 @@ class VerificationStore:
             print(f'=> End Of `{scope}`\n')
     
     def verify_all(self, ignore_err):
+        """Verify all registered scopes in LIFO order."""
         if self.switch:
             try:
                 while self.scope:
@@ -113,6 +159,7 @@ class VerificationStore:
                     print(e)           
     
     def insert_func_attr(self, scope, fname, inputs=[], inputs_map={}, returns=tc.types.TANY, requires=[], ensures=[], decreases=None):
+        """Register attributes (contracts/types) for a function."""
         if self.switch and self.store:
             self.store[scope]['func_attrs'][fname] = {
                 'inputs' : inputs_map,
@@ -127,6 +174,7 @@ class VerificationStore:
             self.func_attrs_global[fname] = self.store[scope]['func_attrs'][fname]
     
     def get_func_attr(self, fname):
+        """Get attributes for a function from the current scope."""
         if self.store:
             # Legacy API: look up in current scope if available
             if self.scope:
@@ -135,12 +183,15 @@ class VerificationStore:
         return None
 
     def current_func_attrs(self):
+        """Get all function attributes in the current scope."""
         if self.scope:
             return self.store[self.scope[-1]]['func_attrs']
     
     def get_func_attrs(self, scope, fname):
+        """Get attributes for a function from a specific scope."""
         # Lookup independent of current scope stack (use provided scope key)
         return self.store[scope]['func_attrs'][fname]
+
 
 STORE = VerificationStore()
 
@@ -361,6 +412,19 @@ def wp_while(sigma, stmt: While, Q):
     ])
 
 def wp(sigma, stmt, Q):
+    """
+    Compute the Weakest Precondition (WP) for statement `stmt` with postcondition `Q`.
+
+    The WP calculus transforms a postcondition `Q` back through the statement `stmt`
+    to find the condition that must hold *before* `stmt` executes to guarantee
+    that `Q` holds *after* `stmt` finishes (and that `stmt` executes safely).
+
+    Returns:
+        Tuple (P, C):
+        -   P: The weakest precondition formula.
+        -   C: A list of side conditions (obligations) that must also be proved
+               (e.g., safety checks, loop invariants).
+    """
     def substitute_many(expr: Expr, mapping: dict):
         result = expr
         for k, v in mapping.items():
@@ -526,6 +590,7 @@ def wp(sigma, stmt, Q):
         Havoc:  lambda: (Quantification(Var(stmt.var + '$0'), sigma[stmt.var], subst(stmt.var, Var(stmt.var + '$0'), Q)), [])
     }.get(type(stmt), lambda: raise_exception(f'wp not implemented for {type(stmt)}'))()
 
+
 def emit_smt(translator: Expr2Z3, solver, constraint : Expr, fail_msg : str):
     solver.push()
     const = translator.visit(UnOp(BoolOps.Not, constraint))
@@ -563,6 +628,26 @@ def generate_refinement_constraints(sigma: dict, func_sigma: dict):
     return constraints
 
 def verify_func(func, scope, inputs, requires, ensures, modifies=None, reads=None):
+    """
+    Verify a single function against its specifications.
+
+    Args:
+        func: The Python function object to verify.
+        scope: The verification scope name.
+        inputs: List of (name, type) tuples for arguments.
+        requires: List of precondition strings/expressions.
+        ensures: List of postcondition strings/expressions.
+        modifies: List of variables the function is allowed to modify (frame).
+        reads: List of variables the function is allowed to read.
+
+    Process:
+    1.  Parse function source code into AST.
+    2.  Type-check the function body.
+    3.  Lower heap operations (lists/dicts) to explicit heap passing.
+    4.  Generate Weakest Precondition (WP) for the body with respect to `ensures`.
+    5.  Check validity using Z3: `requires => WP`.
+    6.  Verify side conditions (invariants, safety, termination).
+    """
     code = inspect.getsource(func)
     # Many users define @verify functions nested inside other functions/methods
     # (e.g., inside a unittest method). Dedent so ast.parse succeeds.

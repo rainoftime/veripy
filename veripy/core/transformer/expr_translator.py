@@ -1,5 +1,17 @@
 """
 Expression translator that converts Python AST to veripy AST.
+
+This module is responsible for bridging the gap between Python's rich syntax
+and the restricted, verifiable subset supported by Veripy. It handles:
+-   **Literals**: Numbers, booleans, strings, and collections (lists, dicts, sets).
+-   **Variables**: Names and attributes.
+-   **Operations**: Arithmetic, logical, and comparison operators.
+-   **Comprehensions**: List/Set/Generator comprehensions (with limitations).
+-   **Function Calls**: Translating built-ins (len, range) and user calls.
+-   **Control Flow Expressions**: If-expressions, lambdas.
+
+Unsupported constructs (e.g., `try-except`, dynamic `eval`) raise exceptions
+during translation to ensure only verifiable code is processed.
 """
 
 import ast
@@ -11,7 +23,11 @@ from .utils import raise_exception
 
 
 class ExprTranslator:
-    """Translator that converts Python AST to veripy AST."""
+    """
+    Translator that converts Python AST to veripy AST.
+    
+    Maintains state for generating fresh variables (e.g., for list literals).
+    """
 
     def __init__(self):
         # Fresh names for list-literal base arrays so different literals do not alias.

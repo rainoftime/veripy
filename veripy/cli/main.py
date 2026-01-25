@@ -3,6 +3,12 @@ Veripy CLI - Production-ready auto-active verification for Python programs
 
 This module provides the command-line interface for the veripy verification tool,
 supporting various verification modes, output formats, and configuration options.
+
+Commands:
+-   `verify`: Verify a Python file or directory.
+-   `check`: syntax and type checking without full verification.
+-   `info`: Display information about the Veripy environment.
+-   `version`: Show version information.
 """
 
 import click

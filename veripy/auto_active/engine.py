@@ -33,7 +33,15 @@ class InferenceStrategy(Enum):
 
 @dataclass
 class InvariantCandidate:
-    """A candidate invariant with confidence score."""
+    """
+    A candidate invariant with confidence score.
+    
+    Attributes:
+        expression: The invariant formula as a string.
+        confidence: Value between 0.0 and 1.0 indicating belief in this invariant.
+        source: Origin of the candidate (e.g., "bounds" inference, "loop" analysis).
+        variables: Set of variables involved in the invariant.
+    """
     expression: str
     confidence: float  # 0.0 to 1.0
     source: str        # "bounds", "type", "arithmetic", "loop", "custom"
@@ -46,10 +54,18 @@ class AutoActiveEngine:
     and generates lemmas to reduce manual annotation burden.
     
     Inspired by Dafny's auto-active approach, this engine attempts to:
-    1. Infer loop invariants from loop structure
-    2. Generate arithmetic lemmas for common patterns
-    3. Infer type-based constraints
-    4. Handle recursive function termination
+    1.  **Infer Loop Invariants**: Analyzes loop structure (e.g., counters, bounds)
+        to guess invariants needed for induction.
+    2.  **Generate Arithmetic Lemmas**: Produces axioms for common properties (commutativity,
+        associativity) that solvers might not instantiate automatically.
+    3.  **Infer Type Constraints**: Adds constraints implied by types (e.g., array lengths >= 0).
+    4.  **Termination Handling**: Checks `decreases` clauses for recursive functions.
+
+    Strategies:
+    -   `NONE`: No automatic inference.
+    -   `SIMPLE`: Basic bounds (x < n) and type constraints.
+    -   `AGGRESSIVE`: Heuristics for relationships between variables (x + y == k).
+    -   `FULL`: Expensive analysis, potentially including quantifier instantiation.
     """
     
     def __init__(self, solver: z3.Solver = None, strategy: InferenceStrategy = InferenceStrategy.SIMPLE):
@@ -70,9 +86,15 @@ class AutoActiveEngine:
         Automatically infer loop invariants based on loop structure.
         
         This method analyzes the loop and attempts to generate invariants that:
-        - Bound loop variables
-        - Capture relationship between loop variables
-        - Track monotonic properties
+        -   **Bound loop variables**: `0 <= i <= n`
+        -   **Capture relationships**: `i == j` if they increment together.
+        -   **Track monotonicity**: `x` only increases.
+
+        Args:
+            loop_info: Dictionary with 'loop_var', 'init', 'condition', 'body'.
+
+        Returns:
+            List of invariant strings.
         """
         invariants = []
         

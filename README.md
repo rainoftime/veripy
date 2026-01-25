@@ -115,9 +115,6 @@ make check         # All checks
 - `pyparsing` - Expression parsing
 - `apronpy` - Abstract interpretation
 
-## Roadmap
+## Related Work
 
-- Improved invariant inference with ML
-- VS Code extension with LSP
-- Performance optimizations
-- Module system and class/object verification
+- Nagini: https://github.com/marcoeilers/nagini

@@ -420,7 +420,7 @@ def safe_http_get(url: str) -> HttpResponse:
 ### **Dafny**
 - ✅ Similar contract syntax
 - ✅ Loop invariants and decreases
-- ❌ Missing: ghost variables, lemmas, Python integration
+- ❌ Missing: Python integration
 
 ### **LiquidHaskell**
 - ✅ Refinement types
