@@ -235,7 +235,14 @@ class ExprTranslator:
             raise_exception('Only single-generator comprehensions supported')
         
         gen = node.generators[0]
-        element_var = Var(gen.target.id)
+        # Support `for x in ...` and (best-effort) tuple destructuring like
+        # `for k, v in ...` by picking a stable binder name.
+        if isinstance(gen.target, ast.Name):
+            element_var = Var(gen.target.id)
+        elif isinstance(gen.target, ast.Tuple) and gen.target.elts and isinstance(gen.target.elts[0], ast.Name):
+            element_var = Var(gen.target.elts[0].id)
+        else:
+            element_var = Var('__comp_target')
         iterable = self.visit(gen.iter)
         
         element_expr = self.visit(node.elt)
@@ -257,7 +264,12 @@ class ExprTranslator:
             raise_exception('Only single-generator comprehensions supported')
         
         gen = node.generators[0]
-        element_var = Var(gen.target.id)
+        if isinstance(gen.target, ast.Name):
+            element_var = Var(gen.target.id)
+        elif isinstance(gen.target, ast.Tuple) and gen.target.elts and isinstance(gen.target.elts[0], ast.Name):
+            element_var = Var(gen.target.elts[0].id)
+        else:
+            element_var = Var('__comp_target')
         iterable = self.visit(gen.iter)
         
         element_expr = self.visit(node.elt)
@@ -280,7 +292,14 @@ class ExprTranslator:
             raise_exception('Only single-generator comprehensions supported')
         
         gen = node.generators[0]
-        element_var = Var(gen.target.id)
+        # Best-effort support for tuple targets (`for k, v in ...`). This
+        # translator currently returns a simplified DictLiteral anyway.
+        if isinstance(gen.target, ast.Name):
+            element_var = Var(gen.target.id)
+        elif isinstance(gen.target, ast.Tuple) and gen.target.elts and isinstance(gen.target.elts[0], ast.Name):
+            element_var = Var(gen.target.elts[0].id)
+        else:
+            element_var = Var('__comp_target')
         iterable = self.visit(gen.iter)
         
         key_expr = self.visit(node.key)

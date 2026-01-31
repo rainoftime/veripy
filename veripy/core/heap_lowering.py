@@ -312,6 +312,14 @@ class HeapLowerer:
                 self.lower_expr(e.source, rewrite_user_calls=rewrite_user_calls),
                 self.lower_expr(e.predicate, rewrite_user_calls=rewrite_user_calls) if e.predicate else None,
             )
+        if isinstance(e, Quantification):
+            # Quantifiers are pure; just lower inside the body.
+            # Bound variables are plain Vars and should not be rewritten.
+            return Quantification(
+                e.var,
+                e.ty,
+                self.lower_expr(e.expr, rewrite_user_calls=rewrite_user_calls),
+            )
         if isinstance(e, FieldAccess):
             obj = self.lower_expr(e.obj, rewrite_user_calls=rewrite_user_calls)
             tag = self.env.field_tags.get(e.field, "any")

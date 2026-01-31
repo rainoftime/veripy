@@ -247,129 +247,144 @@ def _safe_eval_expr(expr: Expr) -> Expr:
     - Z3 array `select` is total; Python list/dict access can raise. We encode
       list/dict accesses via heap-lowering and add obligations on those patterns.
     """
-    obligations: List[Expr] = []
+    TRUE = Literal(VBool(True))
 
-    def add(ob: Expr):
-        obligations.append(ob)
+    def _not(e: Expr) -> Expr:
+        return UnOp(BoolOps.Not, e)
 
-    def rec(e: Expr):
+    def _implies(a: Expr, b: Expr) -> Expr:
+        if isinstance(a, Literal) and isinstance(a.value, VBool) and bool(a.value.v) is True:
+            return b
+        return BinOp(a, BoolOps.Implies, b)
+
+    def safe(e: Expr) -> Expr:
         if isinstance(e, (Var, Literal, StringLiteral)):
-            return
+            return TRUE
+
         if isinstance(e, UnOp):
-            rec(e.e)
-            return
+            return safe(e.e)
+
         if isinstance(e, BinOp):
-            rec(e.e1)
-            rec(e.e2)
+            # Short-circuit boolean connectives.
+            if e.op == BoolOps.And:
+                return _and_expr(safe(e.e1), _implies(e.e1, safe(e.e2)))
+            if e.op == BoolOps.Or:
+                return _and_expr(safe(e.e1), _implies(_not(e.e1), safe(e.e2)))
+            if e.op == BoolOps.Implies:
+                return _and_expr(safe(e.e1), _implies(e.e1, safe(e.e2)))
+            if e.op == BoolOps.Iff:
+                return _and_expr(safe(e.e1), safe(e.e2))
+
+            out = _and_expr(safe(e.e1), safe(e.e2))
             if e.op in (ArithOps.IntDiv, ArithOps.Mod):
-                add(BinOp(e.e2, CompOps.Neq, Literal(VInt(0))))
-            return
+                out = _and_expr(out, BinOp(e.e2, CompOps.Neq, Literal(VInt(0))))
+            return out
+
         if isinstance(e, FunctionCall):
+            out = TRUE
             for a in e.args:
                 if isinstance(a, Expr):
-                    rec(a)
-            return
+                    out = _and_expr(out, safe(a))
+            return out
+
         if isinstance(e, Subscript):
-            rec(e.var)
-            rec(e.subscript)
+            out = _and_expr(safe(e.var), safe(e.subscript))
             # Heap-lowered list read: __heap_list_data_*[ref][idx]
             if isinstance(e.var, Subscript) and isinstance(e.var.var, Var):
                 heap_name = e.var.var.name
                 ref_expr = e.var.subscript
                 idx_expr = e.subscript
                 if heap_name.startswith("__heap_list_data_"):
-                    add(BinOp(idx_expr, CompOps.Ge, Literal(VInt(0))))
-                    add(BinOp(idx_expr, CompOps.Lt, Subscript(Var("__heap_list_len"), ref_expr)))
+                    out = _and_expr(out, BinOp(idx_expr, CompOps.Ge, Literal(VInt(0))))
+                    out = _and_expr(out, BinOp(idx_expr, CompOps.Lt, Subscript(Var("__heap_list_len"), ref_expr)))
                 if heap_name.startswith("__heap_dict_map_"):
                     rest = heap_name.split("__heap_dict_map_", 1)[1]
                     key_tag = rest.split("_", 1)[0]
                     dom_name = f"__heap_dict_dom_{key_tag}"
-                    add(Subscript(Subscript(Var(dom_name), ref_expr), idx_expr))
-            return
+                    out = _and_expr(out, Subscript(Subscript(Var(dom_name), ref_expr), idx_expr))
+            return out
+
         if isinstance(e, Store):
-            rec(e.arr)
-            rec(e.idx)
-            rec(e.val)
+            out = _and_expr(_and_expr(safe(e.arr), safe(e.idx)), safe(e.val))
             # Heap-lowered list write row: Store(__heap_list_data_*[ref], idx, val)
             if isinstance(e.arr, Subscript) and isinstance(e.arr.var, Var):
                 heap_name = e.arr.var.name
                 ref_expr = e.arr.subscript
                 idx_expr = e.idx
                 if heap_name.startswith("__heap_list_data_"):
-                    add(BinOp(idx_expr, CompOps.Ge, Literal(VInt(0))))
-                    add(BinOp(idx_expr, CompOps.Lt, Subscript(Var("__heap_list_len"), ref_expr)))
-            return
-        if isinstance(e, Quantification):
-            if isinstance(e.expr, Expr):
-                rec(e.expr)
-            return
-        if isinstance(e, Old):
-            rec(e.expr)
-            return
-        if isinstance(e, SetLiteral):
-            for x in e.elements:
-                rec(x)
-            return
-        if isinstance(e, DictLiteral):
-            for x in e.keys:
-                rec(x)
-            for x in e.values:
-                rec(x)
-            return
-        if isinstance(e, SetOp):
-            rec(e.left)
-            rec(e.right)
-            return
-        if isinstance(e, DictGet):
-            rec(e.dict_expr)
-            rec(e.key)
-            if e.default:
-                rec(e.default)
-            return
-        if isinstance(e, DictSet):
-            rec(e.dict_expr)
-            rec(e.key)
-            rec(e.value)
-            return
-        if isinstance(e, DictKeys):
-            rec(e.dict_expr)
-            return
-        if isinstance(e, DictValues):
-            rec(e.dict_expr)
-            return
-        if isinstance(e, DictContains):
-            rec(e.dict_expr)
-            rec(e.key)
-            return
-        if isinstance(e, SetCardinality):
-            rec(e.set_expr)
-            return
-        if isinstance(e, FieldAccess):
-            rec(e.obj)
-            return
-        if isinstance(e, MethodCall):
-            rec(e.obj)
-            for a in e.args:
-                rec(a)
-            return
-        if isinstance(e, ListComprehension):
-            rec(e.element_expr)
-            rec(e.iterable)
-            if e.predicate:
-                rec(e.predicate)
-            return
-        if isinstance(e, SetComprehension):
-            rec(e.source)
-            if e.predicate:
-                rec(e.predicate)
-            return
-        raise Exception(f"Safety not implemented for {type(e).__name__}")
+                    out = _and_expr(out, BinOp(idx_expr, CompOps.Ge, Literal(VInt(0))))
+                    out = _and_expr(out, BinOp(idx_expr, CompOps.Lt, Subscript(Var("__heap_list_len"), ref_expr)))
+            return out
 
-    rec(expr)
-    out: Expr = Literal(VBool(True))
-    for ob in obligations:
-        out = _and_expr(out, ob)
-    return out
+        if isinstance(e, Quantification):
+            return Quantification(e.var, e.ty, safe(e.expr))
+
+        if isinstance(e, Old):
+            return safe(e.expr)
+
+        if isinstance(e, SetLiteral):
+            out = TRUE
+            for x in e.elements:
+                out = _and_expr(out, safe(x))
+            return out
+
+        if isinstance(e, DictLiteral):
+            out = TRUE
+            for x in e.keys:
+                out = _and_expr(out, safe(x))
+            for x in e.values:
+                out = _and_expr(out, safe(x))
+            return out
+
+        if isinstance(e, SetOp):
+            return _and_expr(safe(e.left), safe(e.right))
+
+        if isinstance(e, DictGet):
+            out = _and_expr(safe(e.dict_expr), safe(e.key))
+            if e.default:
+                out = _and_expr(out, safe(e.default))
+            return out
+
+        if isinstance(e, DictSet):
+            return _and_expr(_and_expr(safe(e.dict_expr), safe(e.key)), safe(e.value))
+
+        if isinstance(e, DictKeys):
+            return safe(e.dict_expr)
+
+        if isinstance(e, DictValues):
+            return safe(e.dict_expr)
+
+        if isinstance(e, DictContains):
+            return _and_expr(safe(e.dict_expr), safe(e.key))
+
+        if isinstance(e, SetCardinality):
+            return safe(e.set_expr)
+
+        if isinstance(e, FieldAccess):
+            return safe(e.obj)
+
+        if isinstance(e, MethodCall):
+            out = safe(e.obj)
+            for a in e.args:
+                out = _and_expr(out, safe(a))
+            return out
+
+        if isinstance(e, ListComprehension):
+            out = _and_expr(safe(e.element_expr), safe(e.iterable))
+            if e.predicate:
+                out = _and_expr(out, safe(e.predicate))
+            return out
+
+        if isinstance(e, SetComprehension):
+            out = safe(e.source)
+            if e.predicate:
+                out = _and_expr(out, safe(e.predicate))
+            return out
+
+        # Unknown expression forms: be permissive (best-effort).
+        return TRUE
+
+    return safe(expr)
 
 def wp_seq(sigma, stmt, Q):
     (p2, c2) = wp(sigma, stmt.s2, Q)

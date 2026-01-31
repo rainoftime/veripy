@@ -332,8 +332,6 @@ class Expr2Z3:
         if fname == 'len':
             assert len(node.args) == 1
             arr = self.visit(node.args[0])
-            if not (hasattr(arr, "sort") and isinstance(arr.sort(), z3.ArraySortRef)):
-                raise_exception('len expects an array term')
             a_sort = arr.sort()
             len_fun = self._len_funs_by_sort.get(a_sort)
             if len_fun is None:

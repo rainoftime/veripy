@@ -2,9 +2,24 @@
 Pytest configuration for veripy tests.
 
 Sets timeouts per test file to prevent hanging tests.
+Makes timeout output graceful (short message unless VERIPY_TIMEOUT_VERBOSE=1).
 """
-import pytest
 import os
+import sys
+
+import pytest
+
+# Make pytest-timeout output graceful: short message instead of full stack dump.
+# Set VERIPY_TIMEOUT_VERBOSE=1 for full stack traces when debugging.
+if os.environ.get("VERIPY_TIMEOUT_VERBOSE") != "1":
+    import pytest_timeout
+
+    def _graceful_dump_stacks(terminal):
+        terminal.write(
+            "  (Stack dump suppressed. Set VERIPY_TIMEOUT_VERBOSE=1 for full trace.)\n"
+        )
+
+    pytest_timeout.dump_stacks = _graceful_dump_stacks
 
 # Timeout configuration per test file (in seconds)
 TEST_FILE_TIMEOUTS = {
@@ -39,6 +54,7 @@ TEST_FILE_TIMEOUTS = {
     'tests/unit/test_loop_invariants.py': 15,
     'tests/unit/test_quantifiers_comprehensive.py': 15,
     'tests/unit/test_termination.py': 15,
+    'tests/unit/verification/test_termination.py': 60,  # Z3-heavy tree recursion
     'tests/unit/test_frame_conditions.py': 15,
     'tests/unit/test_automatic_inference.py': 15,
     'tests/unit/test_complex_verification.py': 15,
@@ -93,6 +109,7 @@ def pytest_collection_modifyitems(config, items):
         # Set timeout using pytest-timeout marker
         # Remove any existing timeout markers first
         item.own_markers = [m for m in item.own_markers if m.name != 'timeout']
-        # Use 'signal' method instead of 'thread' - works better with blocking C code (like Z3 solver)
-        # Signal method can interrupt blocking operations, thread method cannot
-        item.add_marker(pytest.mark.timeout(timeout, method='signal'))
+        # Platform-aware: thread on macOS (signal unreliable), signal on Linux (interrupts Z3)
+        method = 'thread' if sys.platform == 'darwin' else 'signal'
+        item.add_marker(pytest.mark.timeout(timeout, method=method))
+

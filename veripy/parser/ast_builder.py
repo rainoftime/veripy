@@ -1,4 +1,5 @@
 from veripy.parser import syntax
+from veripy.typecheck import types as tc_types
 from veripy.typecheck.types import to_ast_type
 
 # Minimal substitution helper to avoid external dependencies and import cycles.
@@ -165,21 +166,52 @@ class ProcessQuantification(ASTBuilder):
         self.value = tokens
     
     def makeAST(self):
-        ty = None
-        if len(self.value) == 3:
-            quantifier, var, expr = self.value
-        elif len(self.value) == 4:
-            quantifier, var, ty, expr = self.value
-        if ty is not None:
-            ty = ty.makeAST()
-            ty = to_ast_type(ty.name)
+        # Grammar shape (see parser.py):
+        #   (forall|exists) ( (var [: ty]) (, var [: ty])* ) :: assertion_expr
+        quantifier = self.value[0]
+        # pyparsing's delimitedList flattens results; decls occupy value[1:-1].
+        decls = list(self.value[1:-1])
+        expr = self.value[-1]
 
-        ori = var.makeAST()
-        bounded = syntax.Var(ori.name + '$$0')
-        e = _subst_expr(ori.name, bounded, expr.makeAST())
-        if quantifier == 'exists':
-            # exists x. Q <==> not forall x. not Q
-            return syntax.UnOp(BoolOps.Not,
-                        syntax.Quantification(bounded, ty, syntax.UnOp(BoolOps.Not, e)))
-        else:
-            return syntax.Quantification(bounded, ty, e)
+        # Freshen bound variables to avoid capture across nested quantifiers.
+        if not hasattr(ProcessQuantification, "_qid"):
+            ProcessQuantification._qid = 0
+
+        body = expr.makeAST()
+
+        # Build nested quantifiers, right-associative: forall x, y :: E  == forall x :: forall y :: E
+        for decl in reversed(decls):
+            ProcessQuantification._qid += 1
+            # Each decl is Group(VAR + Optional(: VAR)); elements are ASTBuilder instances.
+            var_builder = decl[0]
+            ty_builder = decl[1] if len(decl) > 1 else None
+
+            ty = None
+            if ty_builder is not None:
+                ty_ast = ty_builder.makeAST()
+                # Quantifier binder types come from the assertion language, where
+                # we parse type tokens as Vars (e.g., Var('int')). Map common
+                # built-ins directly.
+                ty_name = getattr(ty_ast, "name", None)
+                ty = {
+                    "int": tc_types.TINT,
+                    "bool": tc_types.TBOOL,
+                    "str": str,
+                }.get(ty_name)
+                if ty is None:
+                    ty = tc_types.TANY
+
+            ori = var_builder.makeAST()
+            bounded = syntax.Var(f"{ori.name}$${ProcessQuantification._qid}")
+            body = _subst_expr(ori.name, bounded, body)
+
+            if quantifier == 'exists':
+                # exists x. Q <==> not forall x. not Q
+                body = syntax.UnOp(
+                    BoolOps.Not,
+                    syntax.Quantification(bounded, ty, syntax.UnOp(BoolOps.Not, body)),
+                )
+            else:
+                body = syntax.Quantification(bounded, ty, body)
+
+        return body

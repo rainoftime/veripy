@@ -162,6 +162,9 @@ def type_check_expr(sigma: dict, func_sigma : dict, expected, expr: Expr):
 def type_infer_Subscript(sigma, func_sigma, expr: Subscript):
     obj = expr.var
     obj_ty = type_infer_expr(sigma, func_sigma, obj)
+    # Permit subscripting refinement-wrapped collections, e.g. Refined[List[int], ...]
+    if isinstance(obj_ty, ty.TREFINED):
+        obj_ty = obj_ty.base_type
     # index must be int
     if isinstance(obj_ty, ty.TDICT):
         type_check_expr(sigma, func_sigma, obj_ty.key_ty, expr.subscript)
@@ -262,9 +265,11 @@ def type_infer_FunctionCall(sigma, func_sigma: dict, expr: FunctionCall):
         if len(expr.args) != 1:
             raise TypeError('len expects exactly one argument')
         arg_ty = type_infer_expr(sigma, func_sigma, expr.args[0])
-        # Sound subset: allow len() over lists and dicts (modeled via heap lowering).
-        if not isinstance(arg_ty, (ty.TARR, ty.TDICT)):
-            raise TypeError(f'len expects a list or dict, got {arg_ty}')
+        if isinstance(arg_ty, ty.TREFINED):
+            arg_ty = arg_ty.base_type
+        # Best-effort: allow len() over lists and dicts (modeled via heap lowering).
+        # If the argument isn't a collection, keep len(...) as an uninterpreted
+        # int-valued function so specs can mention it without crashing the checker.
         return ty.TINT
     if isinstance(expr.func_name, Var) and expr.func_name.name == '__list_lit':
         # List literals are polymorphic. Use element types when present, otherwise unknown.
